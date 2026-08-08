@@ -12,6 +12,14 @@ real-time, отсутствие аккаунтов и client-side encryption. Ф
   room в квоту входит ciphertext и небольшой служебный overhead.
 - Максимальный размер одного файла по умолчанию также 500 MiB.
 - Любой участник комнаты может загрузить, скачать или удалить файл.
+- Новая комната создаётся в R/W-сессии. Для неё доступны отдельные ссылки R/O и
+  R/W; сервер проверяет write capability для любых изменений.
+- Одинаковая capability-модель применяется к открытым и encrypted rooms. В
+  открытой комнате R/O URL остаётся простым `/r/{id}`, а R/W URL дополнительно
+  содержит write capability во fragment.
+- Клиент может задать добровольный alias. Alias не подтверждает личность, не
+  резервируется и не даёт прав; он неизменно сохраняется рядом с созданной
+  записью или файлом.
 - Основное хранилище — локальная файловая система; SQLite хранит метаданные,
   upload sessions, reservations и связь с комнатой.
 - Стандартный каталог systemd installation:
@@ -29,6 +37,71 @@ real-time, отсутствие аккаунтов и client-side encryption. Ф
 
 Эти значения будут настраиваться флагами и environment variables.
 
+## R/O и R/W capability-ссылки
+
+### Почему это работает и для открытых комнат
+
+Простой room ID продолжает давать право читать комнату. Право изменения отделяется
+от room ID случайным 256-bit write capability:
+
+```text
+R/O open:       https://example/r/room-id
+R/W open:       https://example/r/room-id#write=cw1_...
+R/O encrypted:  https://example/r/room-id#key=ce1_...
+R/W encrypted:  https://example/r/room-id#key=ce1_...&write=cw1_...
+```
+
+URL fragment не передаётся в HTTP request, proxy access log или `Referer`. Web UI
+извлекает capability локально и передаёт его только для mutating API. Сервер
+хранит SHA-256 hash capability и сравнивает его constant-time; plaintext token в
+SQLite не сохраняется.
+
+R/O пользователь может читать, расшифровывать, копировать и скачивать, но сервер
+отклоняет add/delete/upload/abort/complete/rotate без write capability. UI также
+скрывает или блокирует mutating controls, однако это только UX — реальная проверка
+всегда выполняется сервером.
+
+Для chunk upload исходный write capability используется только при создании
+upload session. Сервер возвращает отдельный ограниченный upload token, пригодный
+только для чанков, complete и abort этой загрузки.
+
+Предусматривается rotation write capability, подтверждённая текущим capability.
+Она немедленно отзывает старые R/W-ссылки, не меняя R/O-ссылку и encryption key.
+Потерянный write capability восстановить нельзя: это соответствует модели bearer
+capability без аккаунтов и администратора комнаты.
+
+### Обратная совместимость
+
+Существующие комнаты не имеют write capability и остаются в legacy R/W-режиме:
+room ID продолжает разрешать изменения. Без прежнего секрета сервер не может
+безопасно назначить первого владельца и автоматически превратить такую комнату в
+защищённую.
+
+Все новые комнаты создаются в capability-режиме. Для переноса legacy room в новую
+модель пользователь создаёт новую комнату и переносит нужные записи. Возможный
+отдельный admin-assisted migration не входит в публичный API.
+
+## Добровольный alias
+
+- Alias задаётся и редактируется локально, сохраняется в browser storage и
+  автоматически предлагается для следующих сообщений/файлов.
+- Значение копируется в конкретную запись при её создании. Последующее изменение
+  локального alias не меняет историю.
+- Alias может быть пустым, не обязан быть уникальным и не подтверждается ключом,
+  подписью или сервером. Любой R/W-участник может назваться любым именем.
+- Alias никогда не используется для авторизации, ownership или ограничения
+  удаления.
+- Для безопасности интерфейса сохраняются только технические ограничения:
+  корректный UTF-8, максимум 64 Unicode code points и отображение через
+  `textContent`, без HTML interpretation. Это не identity validation.
+- В открытой комнате alias виден серверу. В encrypted room alias включается в
+  encrypted message/file manifest и серверу не раскрывается.
+- UI показывает alias рядом с датой. Для старой записи без alias эта область не
+  отображается.
+- Text encryption envelope получает версию v2 с JSON payload `{text, alias}`;
+  decrypt v1 остаётся для существующих записей. File manifest сразу включает
+  alias.
+
 ## Архитектура хранения
 
 ### SQLite
@@ -39,6 +112,8 @@ real-time, отсутствие аккаунтов и client-side encryption. Ф
   полученные чанки, срок действия и encryption metadata;
 - `files`: file ID, room ID, storage object, размеры, chunk layout, manifest,
   key ID, protocol version и timestamps;
+- `rooms`: nullable write capability hash и access-mode version;
+- текстовые items: alias для open payload либо alias внутри encrypted v2 payload;
 - связь завершённого файла с общей timeline комнаты.
 
 Reservation создаётся транзакционно. Одновременные загрузки не смогут суммарно
@@ -63,6 +138,7 @@ commit всей загрузки.
 
 ```text
 GET    /api/capabilities
+POST   /api/rooms/{room}/write-capability/rotate
 POST   /api/rooms/{room}/uploads
 GET    /api/rooms/{room}/uploads/{upload}
 PUT    /api/rooms/{room}/uploads/{upload}/chunks/{index}
@@ -82,7 +158,8 @@ layout, необходимый клиенту для последователь�
 
 Ошибки API получают стабильные machine-readable codes: quota exceeded, upload
 expired, chunk conflict, invalid chunk, incomplete upload, file missing и storage
-unavailable.
+unavailable. Для mutation access добавляются `write_capability_required` и
+`invalid_write_capability` с HTTP 403.
 
 ## Client-side encryption
 
@@ -108,6 +185,9 @@ service worker: он формирует download response и принимает 
 ## Web UI
 
 - drag-and-drop и обычный file picker;
+- локальная настройка alias и отображение alias рядом с датой;
+- режим R/O без composer/delete/upload controls;
+- share dialog с отдельными R/O и R/W ссылками и QR-кодами;
 - выбор нескольких файлов;
 - очередь с прогрессом каждого файла и общим использованием quota;
 - cancel и retry/resume;
@@ -144,6 +224,8 @@ file storage.
 ### 2.1 — protocol и storage foundation
 
 - capabilities endpoint и protocol document;
+- write capability generation, hashing, mutation middleware и rotation;
+- encrypted text payload v2 с alias и поддержкой чтения v1;
 - SQLite migration framework;
 - metadata/upload schema;
 - filesystem store abstraction;
@@ -159,6 +241,7 @@ file storage.
 - streaming/Range download и delete;
 - timeline/WebSocket integration;
 - drag-and-drop, progress, retry и download в Web UI;
+- R/O/R/W share UX и alias для текстовых записей и файлов;
 - browser tests Chrome, Firefox и Android viewport.
 
 Результат: полноценные файлы в открытых комнатах. Планируемый prerelease: v0.3.0.
@@ -190,6 +273,13 @@ file storage.
 - Файл размером до 500 МБ загружается и скачивается без удержания целого файла в
   RAM клиента или сервера.
 - Несколько клиентов видят завершённые upload/delete события в real-time.
+- R/O-ссылка не позволяет изменить комнату даже прямым API-запросом; R/W-ссылка
+  разрешает изменения, а rotation отзывает старую R/W-ссылку.
+- Capability работает одинаково для open и encrypted rooms; encryption key сам по
+  себе не даёт write permission.
+- Alias неизменно связан с записью, отображается рядом с датой и явно считается
+  непроверенной самоидентификацией, а не авторизацией.
+- Старые encrypted v1 записи без alias продолжают расшифровываться.
 - Обрыв сети допускает продолжение загрузки без повторной передачи готовых чанков.
 - Параллельные uploads не обходят room quota.
 - Crash/restart не публикует неполный файл и не оставляет постоянную reservation.
