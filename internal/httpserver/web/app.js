@@ -153,7 +153,10 @@
       state.capabilities = await api("/api/capabilities");
       await refresh();
       show("file-drop", state.canWrite);
-      if (state.room.encrypted) { await ensureDownloadWorker(); await prepareKey(); }
+      if (state.room.encrypted) {
+        await prepareKey();
+        ensureDownloadWorker().catch((error) => message("crypto-warning", `Потоковое скачивание пока недоступно: ${error.message}`));
+      }
       else { $("encryption-state").textContent = "Без шифрования"; $("file-input").disabled = !state.canWrite; renderItems(); }
       connect();
     } catch (error) { message("room-error", error.message); $("item-text").disabled = true; $("send").disabled = true; }
