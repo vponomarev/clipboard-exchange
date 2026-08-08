@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#111827">
+  <title>Clipboard Exchange</title>
+  <link rel="stylesheet" href="/assets/style.css">
+  <script defer src="/assets/qrcode.min.js"></script>
+  <script defer src="/assets/app.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="Clipboard Exchange — главная">
+      <span class="brand-mark" aria-hidden="true">⇄</span>
+      <span>Clipboard Exchange</span>
+    </a>
+    <span id="connection" class="connection hidden" role="status"></span>
+  </header>
+
+  <main>
+    <section id="home" class="panel home hidden">
+      <p class="eyebrow">Общий буфер без регистрации</p>
+      <h1>Переносите текст между устройствами</h1>
+      <p class="lead">Создайте комнату, откройте ссылку на другом устройстве — изменения появятся сразу.</p>
+
+      <form id="create-form" class="create-card">
+        <label for="room-id">ID комнаты</label>
+        <div class="input-action">
+          <input id="room-id" name="room" maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9_-]{0,63}" autocomplete="off" spellcheck="false" required>
+          <button id="random-id" class="button secondary" type="button">Новый UUID</button>
+        </div>
+        <p class="hint">Короткие имена легко угадать. Используйте их только в доверенной сети.</p>
+
+        <label class="check-row">
+          <input id="encrypted" type="checkbox">
+          <span><strong>Шифровать в браузере</strong><small>Сервер будет видеть только зашифрованные данные и метаданные.</small></span>
+        </label>
+
+        <div id="encryption-options" class="encryption-options hidden">
+          <label for="room-key">Ключ или пароль</label>
+          <div class="input-action">
+            <input id="room-key" type="password" autocomplete="new-password" placeholder="Оставьте пустым для случайного ключа">
+            <button id="toggle-create-key" class="icon-button" type="button" aria-label="Показать ключ">◉</button>
+          </div>
+          <p class="hint">Пароль преобразуется в ключ локально. Случайный ключ безопаснее.</p>
+        </div>
+
+        <p id="create-error" class="error hidden" role="alert"></p>
+        <button class="button primary wide" type="submit">Создать комнату</button>
+      </form>
+    </section>
+
+    <section id="room" class="room hidden">
+      <div class="room-heading">
+        <div>
+          <p class="eyebrow">Комната</p>
+          <h1 id="room-name"></h1>
+        </div>
+        <div class="room-actions">
+          <button id="share" class="button secondary" type="button">Поделиться</button>
+          <a class="button secondary" href="/">Новая комната</a>
+        </div>
+      </div>
+
+      <div id="crypto-warning" class="notice warning hidden" role="alert"></div>
+      <div id="room-error" class="notice error hidden" role="alert"></div>
+
+      <form id="item-form" class="composer">
+        <label class="sr-only" for="item-text">Текст для обмена</label>
+        <textarea id="item-text" maxlength="65536" placeholder="Вставьте текст, команду или несколько строк…" rows="5" required></textarea>
+        <div class="composer-footer">
+          <span id="encryption-state" class="encryption-state"></span>
+          <button id="send" class="button primary" type="submit">Добавить</button>
+        </div>
+      </form>
+
+      <div class="list-heading">
+        <h2>Записи</h2>
+        <span id="item-count" class="muted"></span>
+      </div>
+      <div id="empty" class="empty hidden">Пока пусто. Добавьте первую запись.</div>
+      <div id="items" class="items" aria-live="polite"></div>
+    </section>
+  </main>
+
+  <dialog id="key-dialog">
+    <form id="key-form" method="dialog" class="dialog-card">
+      <h2>Введите ключ комнаты</h2>
+      <p>Ключ останется в памяти этого браузера и не будет отправлен серверу.</p>
+      <label for="unlock-key">Ключ или пароль</label>
+      <div class="input-action">
+        <input id="unlock-key" type="password" autocomplete="current-password" required autofocus>
+        <button id="toggle-unlock-key" class="icon-button" type="button" aria-label="Показать ключ">◉</button>
+      </div>
+      <p id="key-error" class="error hidden" role="alert"></p>
+      <div class="dialog-actions">
+        <a class="button secondary" href="/">Выйти</a>
+        <button class="button primary" value="default">Открыть</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="share-dialog">
+    <div class="dialog-card share-card">
+      <button class="dialog-close icon-button" type="button" aria-label="Закрыть">×</button>
+      <h2>Открыть на другом устройстве</h2>
+      <div id="qr"></div>
+      <label for="share-url">Ссылка комнаты</label>
+      <div class="input-action">
+        <input id="share-url" readonly>
+        <button id="copy-link" class="button secondary" type="button">Копировать</button>
+      </div>
+      <div id="share-choice" class="share-choice hidden">
+        <label><input type="radio" name="share-mode" value="key" checked> С ключом</label>
+        <label><input type="radio" name="share-mode" value="plain"> Без ключа</label>
+      </div>
+      <p id="share-note" class="hint"></p>
+    </div>
+  </dialog>
+
+  <div id="toast" class="toast hidden" role="status"></div>
+</body>
+</html>
+

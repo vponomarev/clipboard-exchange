@@ -1,0 +1,11 @@
+{
+  "name": "clipboard-exchange-e2e",
+  "private": true,
+  "scripts": {
+    "pretest:e2e": "go build -buildvcs=false -o clipboard-exchange-e2e.exe ./cmd/clipboard-exchange",
+    "test:e2e": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.62.1"
+  }
+}

@@ -1,0 +1,12 @@
+/.idea/
+/.cache/
+/bin/
+/dist/
+/data/
+/test-results/
+/playwright-report/
+/node_modules/
+/clipboard-exchange-e2e*
+*.db
+*.db-shm
+*.db-wal
