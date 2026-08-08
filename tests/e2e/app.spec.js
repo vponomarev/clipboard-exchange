@@ -1,5 +1,16 @@
 const { test, expect } = require("@playwright/test");
 
+test("HTTP-compatible UUID fallback initializes the page and honors room query", async ({ page }) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(Crypto.prototype, "randomUUID", { value: undefined, configurable: true });
+  });
+  const room = `fallback-${crypto.randomUUID()}`;
+  await page.goto(`/?room=${room}`);
+  await expect(page.locator("#room-id")).toHaveValue(room);
+  await page.getByRole("button", { name: "Создать комнату" }).click();
+  await expect(page).toHaveURL(new RegExp(`/r/${room}$`));
+});
+
 test("plain room preserves multiline text and updates another client", async ({ page, browser }) => {
   const room = `plain-${crypto.randomUUID()}`;
   await page.goto("/");

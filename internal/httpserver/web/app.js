@@ -40,7 +40,15 @@
     return data;
   }
 
-  function uuid() { return crypto.randomUUID(); }
+  function uuid() {
+    if (typeof globalThis.crypto?.randomUUID === "function") return crypto.randomUUID();
+    if (typeof globalThis.crypto?.getRandomValues !== "function") throw new Error("Браузер не поддерживает безопасную генерацию UUID");
+    const bytes = crypto.getRandomValues(new Uint8Array(16));
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const hex = Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("");
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+  }
   function show(id, visible = true) { $(id).classList.toggle("hidden", !visible); }
   function message(id, text) { $(id).textContent = text; show(id, Boolean(text)); }
   function toast(text) {
@@ -61,7 +69,8 @@
 
   function initHome() {
     show("home");
-    $("room-id").value = uuid();
+    const requestedRoom = new URLSearchParams(location.search).get("room");
+    $("room-id").value = requestedRoom && /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(requestedRoom) ? requestedRoom : uuid();
     $("random-id").addEventListener("click", () => { $("room-id").value = uuid(); });
     $("encrypted").addEventListener("change", () => show("encryption-options", $("encrypted").checked));
     $("toggle-create-key").addEventListener("click", (e) => togglePassword("room-key", e.currentTarget));
