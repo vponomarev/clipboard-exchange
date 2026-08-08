@@ -15,12 +15,25 @@ import (
 	"github.com/vponomarev/clipboard-exchange/internal/config"
 	"github.com/vponomarev/clipboard-exchange/internal/httpserver"
 	"github.com/vponomarev/clipboard-exchange/internal/store"
+	"github.com/vponomarev/clipboard-exchange/internal/systemd"
 )
 
 var version = "dev"
 
 func main() {
+	if len(os.Args) > 1 && systemd.IsCommand(os.Args[1]) {
+		if err := systemd.Run(os.Args[1:], version); err != nil {
+			log.Printf("systemd: %v", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	cfg := config.Default()
+	if err := config.ApplyEnvironment(&cfg); err != nil {
+		log.Printf("invalid environment configuration: %v", err)
+		os.Exit(2)
+	}
 	config.BindFlags(flag.CommandLine, &cfg)
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()

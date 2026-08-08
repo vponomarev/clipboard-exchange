@@ -1,6 +1,10 @@
 package config
 
-import "testing"
+import (
+	"strings"
+	"testing"
+	"time"
+)
 
 func TestValidateTLSIsPair(t *testing.T) {
 	cfg := Default()
@@ -19,5 +23,29 @@ func TestValidateLimits(t *testing.T) {
 	cfg.MaxItemsPerRoom = 0
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("expected error for zero item limit")
+	}
+}
+
+func TestApplyEnvironment(t *testing.T) {
+	t.Setenv("CLIPBOARD_EXCHANGE_LISTEN", "127.0.0.1:9090")
+	t.Setenv("CLIPBOARD_EXCHANGE_DATABASE", "/tmp/exchange.db")
+	t.Setenv("CLIPBOARD_EXCHANGE_ROOM_TTL", "48h")
+	t.Setenv("CLIPBOARD_EXCHANGE_MAX_ITEMS_PER_ROOM", "42")
+	t.Setenv("CLIPBOARD_EXCHANGE_TRUST_PROXY", "true")
+	cfg := Default()
+	if err := ApplyEnvironment(&cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Listen != "127.0.0.1:9090" || cfg.DatabasePath != "/tmp/exchange.db" || cfg.RoomTTL != 48*time.Hour || cfg.MaxItemsPerRoom != 42 || !cfg.TrustProxy {
+		t.Fatalf("unexpected environment config: %+v", cfg)
+	}
+}
+
+func TestApplyEnvironmentRejectsInvalidValue(t *testing.T) {
+	t.Setenv("CLIPBOARD_EXCHANGE_RATE_LIMIT", "many")
+	cfg := Default()
+	err := ApplyEnvironment(&cfg)
+	if err == nil || !strings.Contains(err.Error(), "CLIPBOARD_EXCHANGE_RATE_LIMIT") {
+		t.Fatalf("expected named parse error, got %v", err)
 	}
 }

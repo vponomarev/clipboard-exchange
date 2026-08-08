@@ -3,6 +3,9 @@ package config
 import (
 	"errors"
 	"flag"
+	"fmt"
+	"os"
+	"strconv"
 	"time"
 )
 
@@ -42,6 +45,70 @@ func BindFlags(fs *flag.FlagSet, cfg *Config) {
 	fs.IntVar(&cfg.MaxRooms, "max-rooms", cfg.MaxRooms, "maximum rooms")
 	fs.IntVar(&cfg.RateLimit, "rate-limit", cfg.RateLimit, "mutating requests per IP per minute (0 disables)")
 	fs.BoolVar(&cfg.TrustProxy, "trust-proxy", false, "trust Forwarded and X-Forwarded-* headers")
+}
+
+func ApplyEnvironment(cfg *Config) error {
+	setString := func(name string, target *string) {
+		if value, ok := os.LookupEnv(name); ok {
+			*target = value
+		}
+	}
+	setInt := func(name string, target *int) error {
+		value, ok := os.LookupEnv(name)
+		if !ok {
+			return nil
+		}
+		parsed, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("%s: %w", name, err)
+		}
+		*target = parsed
+		return nil
+	}
+	setInt64 := func(name string, target *int64) error {
+		value, ok := os.LookupEnv(name)
+		if !ok {
+			return nil
+		}
+		parsed, err := strconv.ParseInt(value, 10, 64)
+		if err != nil {
+			return fmt.Errorf("%s: %w", name, err)
+		}
+		*target = parsed
+		return nil
+	}
+
+	setString("CLIPBOARD_EXCHANGE_LISTEN", &cfg.Listen)
+	setString("CLIPBOARD_EXCHANGE_DATABASE", &cfg.DatabasePath)
+	setString("CLIPBOARD_EXCHANGE_TLS_CERT", &cfg.TLSCert)
+	setString("CLIPBOARD_EXCHANGE_TLS_KEY", &cfg.TLSKey)
+	if value, ok := os.LookupEnv("CLIPBOARD_EXCHANGE_ROOM_TTL"); ok {
+		parsed, err := time.ParseDuration(value)
+		if err != nil {
+			return fmt.Errorf("CLIPBOARD_EXCHANGE_ROOM_TTL: %w", err)
+		}
+		cfg.RoomTTL = parsed
+	}
+	if err := setInt64("CLIPBOARD_EXCHANGE_MAX_ITEM_BYTES", &cfg.MaxItemBytes); err != nil {
+		return err
+	}
+	if err := setInt("CLIPBOARD_EXCHANGE_MAX_ITEMS_PER_ROOM", &cfg.MaxItemsPerRoom); err != nil {
+		return err
+	}
+	if err := setInt("CLIPBOARD_EXCHANGE_MAX_ROOMS", &cfg.MaxRooms); err != nil {
+		return err
+	}
+	if err := setInt("CLIPBOARD_EXCHANGE_RATE_LIMIT", &cfg.RateLimit); err != nil {
+		return err
+	}
+	if value, ok := os.LookupEnv("CLIPBOARD_EXCHANGE_TRUST_PROXY"); ok {
+		parsed, err := strconv.ParseBool(value)
+		if err != nil {
+			return fmt.Errorf("CLIPBOARD_EXCHANGE_TRUST_PROXY: %w", err)
+		}
+		cfg.TrustProxy = parsed
+	}
+	return nil
 }
 
 func (c Config) Validate() error {

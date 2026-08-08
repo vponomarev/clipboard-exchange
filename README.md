@@ -50,6 +50,50 @@ SQLite и весь интерфейс встроены в один бинарн�
 --trust-proxy=false            доверять Forwarded/X-Forwarded-For
 ```
 
+## Установка как systemd service
+
+Команды установки встроены в Linux-бинарник и требуют root. Установка копирует
+текущий бинарник в `/usr/local/bin`, создаёт отдельного системного пользователя,
+каталоги конфигурации и данных, включает сервис и сразу запускает его:
+
+```bash
+sudo ./clipboard-exchange install --listen=:8080
+systemctl status clipboard-exchange
+```
+
+Параметры сервера сохраняются в
+`/etc/clipboard-exchange/clipboard-exchange.env`. После ручного изменения файла:
+
+```bash
+sudo systemctl restart clipboard-exchange
+```
+
+Обновление выполняется новым бинарником, скачанным из проверенного релиза. Старый
+бинарник сохраняется как `/usr/local/bin/clipboard-exchange.previous`; если новый
+сервис не перезапустится, команда автоматически откатит бинарник:
+
+```bash
+curl -fLO https://github.com/vponomarev/clipboard-exchange/releases/download/VERSION/clipboard-exchange-linux-amd64.tar.gz
+curl -fLO https://github.com/vponomarev/clipboard-exchange/releases/download/VERSION/checksums.txt
+sha256sum -c checksums.txt
+tar -xzf clipboard-exchange-linux-amd64.tar.gz
+sudo ./clipboard-exchange-linux-amd64/clipboard-exchange upgrade
+```
+
+Обычное удаление сохраняет конфигурацию и SQLite, поэтому последующая установка
+может использовать прежние данные:
+
+```bash
+sudo /usr/local/bin/clipboard-exchange deinstall
+```
+
+Полное удаление данных, конфигурации и service user необратимо и выполняется только
+с явным параметром:
+
+```bash
+sudo /usr/local/bin/clipboard-exchange deinstall --purge
+```
+
 ## Reverse proxy
 
 Минимальная конфигурация nginx с TLS termination и WebSocket:
