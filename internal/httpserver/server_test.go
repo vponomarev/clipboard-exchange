@@ -159,6 +159,9 @@ func TestServesEmbeddedApplication(t *testing.T) {
 	if !bytes.Contains(body, []byte(`/assets/app.js?v=3`)) {
 		t.Fatal("page does not cache-bust app.js")
 	}
+	if !bytes.Contains(body, []byte(`/assets/style.css?v=3`)) {
+		t.Fatal("page does not cache-bust style.css")
+	}
 
 	resp, err = ts.Client().Get(ts.URL + "/assets/app.js?v=3")
 	if err != nil {
