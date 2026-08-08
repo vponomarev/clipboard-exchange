@@ -39,6 +39,7 @@ func TestEnvironmentFileContainsServerConfiguration(t *testing.T) {
 	cfg := config.Default()
 	cfg.Listen = "127.0.0.1:8080"
 	cfg.DatabasePath = "/var/lib/clipboard-exchange/data.db"
+	cfg.FilesDir = "/var/lib/clipboard-exchange/files"
 	cfg.RoomTTL = 48 * time.Hour
 	cfg.TrustProxy = true
 	env := environmentFile(cfg)
@@ -47,6 +48,8 @@ func TestEnvironmentFileContainsServerConfiguration(t *testing.T) {
 		`CLIPBOARD_EXCHANGE_DATABASE="/var/lib/clipboard-exchange/data.db"`,
 		`CLIPBOARD_EXCHANGE_ROOM_TTL="48h0m0s"`,
 		`CLIPBOARD_EXCHANGE_TRUST_PROXY="true"`,
+		`CLIPBOARD_EXCHANGE_FILES_DIR="/var/lib/clipboard-exchange/files"`,
+		`CLIPBOARD_EXCHANGE_MAX_ROOM_FILE_BYTES="524288000"`,
 	} {
 		if !strings.Contains(env, expected) {
 			t.Errorf("environment file does not contain %q", expected)

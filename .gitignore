@@ -1,10 +1,14 @@
 /.idea/
 /.cache/
+/.gocache/
 /bin/
 /dist/
 /data/
 /test-results/
 /playwright-report/
+/e2e-files/
+/phase2-source.tar.gz
+/debug.log
 /node_modules/
 /clipboard-exchange-e2e*
 *.db

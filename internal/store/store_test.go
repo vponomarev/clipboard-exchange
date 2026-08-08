@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"path/filepath"
 	"testing"
@@ -21,18 +22,18 @@ func testStore(t *testing.T) *Store {
 func TestRoomAndExactMultilineText(t *testing.T) {
 	s := testStore(t)
 	ctx := context.Background()
-	if err := s.CreateRoom(ctx, Room{ID: "home"}, 10); err != nil {
+	if err := s.CreateRoom(ctx, Room{ID: "home", WriteHash: "hash-one"}, 10); err != nil {
 		t.Fatal(err)
 	}
 	want := "  printf '%s\\n' \"$PATH\"  \n\tsecond line\n"
-	if err := s.AddItem(ctx, "home", Item{ID: "123e4567-e89b-12d3-a456-426614174000", Kind: "text", Content: want}, 10); err != nil {
+	if err := s.AddItem(ctx, "home", Item{ID: "123e4567-e89b-12d3-a456-426614174000", Kind: "text", Content: want, Alias: "Вася"}, 10); err != nil {
 		t.Fatal(err)
 	}
 	items, err := s.ListItems(ctx, "home")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(items) != 1 || items[0].Content != want {
+	if len(items) != 1 || items[0].Content != want || items[0].Alias != "Вася" {
 		t.Fatalf("text changed: %#v", items)
 	}
 	if err := s.DeleteItem(ctx, "home", items[0].ID); err != nil {
@@ -44,10 +45,50 @@ func TestRoomAndExactMultilineText(t *testing.T) {
 	}
 }
 
+func TestWriteAuthorizationAndRotation(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	if err := s.CreateRoom(ctx, Room{ID: "rights", WriteHash: "hash-one"}, 10); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AuthorizeWrite(ctx, "rights", "wrong"); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("wrong hash: %v", err)
+	}
+	if err := s.AuthorizeWrite(ctx, "rights", "hash-one"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RotateWriteHash(ctx, "rights", "hash-one", "hash-two"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AuthorizeWrite(ctx, "rights", "hash-one"); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("old hash remains valid: %v", err)
+	}
+	if err := s.AuthorizeWrite(ctx, "rights", "hash-two"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLegacyDatabaseRequiresCleanStart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE rooms (id TEXT PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(path); err == nil {
+		t.Fatal("legacy database was opened without an explicit migration")
+	}
+}
+
 func TestEncryptedRoomRejectsWrongKeyAndPlaintext(t *testing.T) {
 	s := testStore(t)
 	ctx := context.Background()
-	if err := s.CreateRoom(ctx, Room{ID: "secret", Encrypted: true, KeyID: "key-one"}, 10); err != nil {
+	if err := s.CreateRoom(ctx, Room{ID: "secret", Encrypted: true, KeyID: "key-one", WriteHash: "hash"}, 10); err != nil {
 		t.Fatal(err)
 	}
 	base := Item{ID: "123e4567-e89b-12d3-a456-426614174000", Kind: "encrypted", Ciphertext: "cipher", IV: "nonce", KeyID: "wrong", Version: 1}
@@ -63,10 +104,10 @@ func TestEncryptedRoomRejectsWrongKeyAndPlaintext(t *testing.T) {
 func TestLimitsAndCleanup(t *testing.T) {
 	s := testStore(t)
 	ctx := context.Background()
-	if err := s.CreateRoom(ctx, Room{ID: "one"}, 1); err != nil {
+	if err := s.CreateRoom(ctx, Room{ID: "one", WriteHash: "hash"}, 1); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.CreateRoom(ctx, Room{ID: "two"}, 1); !errors.Is(err, ErrLimit) {
+	if err := s.CreateRoom(ctx, Room{ID: "two", WriteHash: "hash"}, 1); !errors.Is(err, ErrLimit) {
 		t.Fatalf("room limit: %v", err)
 	}
 	first := Item{ID: "123e4567-e89b-12d3-a456-426614174000", Kind: "text", Content: "one"}
@@ -83,5 +124,37 @@ func TestLimitsAndCleanup(t *testing.T) {
 	}
 	if _, err := s.GetRoom(ctx, "one"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("room remains: %v", err)
+	}
+}
+
+func TestUploadReservationsEnforceRoomQuota(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	if err := s.CreateRoom(ctx, Room{ID: "files", WriteHash: "hash"}, 10); err != nil {
+		t.Fatal(err)
+	}
+	first := Upload{ID: "123e4567-e89b-12d3-a456-426614174000", RoomID: "files", FileID: "123e4567-e89b-12d3-a456-426614174001", Name: "one", MIMEType: "application/octet-stream", Size: 7, ChunkSize: 4, ChunkCount: 2, TokenHash: "token", ExpiresAt: time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano)}
+	if err := s.CreateUpload(ctx, first, 10, 10); err != nil {
+		t.Fatal(err)
+	}
+	second := first
+	second.ID = "123e4567-e89b-12d3-a456-426614174002"
+	second.FileID = "123e4567-e89b-12d3-a456-426614174003"
+	second.Size = 4
+	if err := s.CreateUpload(ctx, second, 10, 10); !errors.Is(err, ErrLimit) {
+		t.Fatalf("quota reservation was bypassed: %v", err)
+	}
+	if err := s.RecordChunk(ctx, first.ID, 0, 4, "a", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordChunk(ctx, first.ID, 1, 3, "b", ""); err != nil {
+		t.Fatal(err)
+	}
+	file, err := s.CompleteUpload(ctx, "files", first.ID, "", "", 0)
+	if err != nil || file.Size != 7 {
+		t.Fatalf("complete upload: file=%#v err=%v", file, err)
+	}
+	if err := s.CreateUpload(ctx, second, 10, 10); !errors.Is(err, ErrLimit) {
+		t.Fatalf("completed file was not counted in quota: %v", err)
 	}
 }

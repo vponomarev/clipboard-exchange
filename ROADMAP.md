@@ -16,7 +16,9 @@ Android. На Android также проверены QR-код и смена ор
 
 ## Фаза 2 — файлы
 
-Статус: запланирована.
+Статус: реализована, идёт hardening и приёмка. Работают capability-права R/O/R/W,
+ротация, alias, resumable open/encrypted uploads, квоты, Range-download, потоковое
+client-side расшифрование и очистка storage.
 
 Подробный технический план: [PHASE2.md](PHASE2.md).
 
