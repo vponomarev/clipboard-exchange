@@ -109,6 +109,7 @@ test("interrupted upload resumes after reload and verifies completed chunks", as
   await page.locator("#file-input").setInputFiles(selected);
   await expect(page.locator(".upload-row .muted")).toContainText("Ошибка");
   await page.reload();
+  await expect(page.locator("#file-input")).toBeEnabled();
   await page.locator("#file-input").setInputFiles(selected);
   await expect(page.locator(".file-item .file-name")).toHaveText("resume.bin");
   const data = await (await request.get(`/api/rooms/${room}`)).json();
@@ -199,11 +200,12 @@ test("encrypted upload resumes without retransmitting a verified chunk", async (
   await page.locator("#file-input").setInputFiles(selected);
   await expect(page.locator(".upload-row .muted")).toContainText("Ошибка");
   await page.reload();
+  await expect(page.locator("#file-input")).toBeEnabled();
   await page.locator("#file-input").setInputFiles(selected);
   await expect(page.locator(".file-item .file-name")).toHaveText("encrypted-resume.bin");
 });
 
-test("encrypted room can be unlocked with separately shared passphrase", async ({ page }) => {
+test("encrypted room can be unlocked with separately shared passphrase", async ({ page, browser }) => {
   const room = `password-${crypto.randomUUID()}`;
   const password = "correct horse battery staple";
   await page.goto("/");
@@ -214,11 +216,14 @@ test("encrypted room can be unlocked with separately shared passphrase", async (
   await page.locator("#item-text").fill("exact secret");
   await page.getByRole("button", { name: "Добавить", exact: true }).click();
 
-  await page.goto(`/r/${room}`);
-  await expect(page.locator("#key-dialog")).toBeVisible();
-  await page.locator("#unlock-key").fill(password);
-  await page.getByRole("button", { name: "Открыть" }).click();
-  await expect(page.locator(".item-content")).toHaveText("exact secret");
+  const readerContext = await browser.newContext();
+  const reader = await readerContext.newPage();
+  await reader.goto(`/r/${room}`);
+  await expect(reader.locator("#key-dialog")).toBeVisible();
+  await reader.locator("#unlock-key").fill(password);
+  await reader.getByRole("button", { name: "Открыть" }).click();
+  await expect(reader.locator(".item-content")).toHaveText("exact secret");
+  await readerContext.close();
 });
 
 test("mobile layout can create a room and show QR", async ({ page }, testInfo) => {

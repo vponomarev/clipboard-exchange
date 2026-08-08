@@ -131,6 +131,7 @@
 
   async function initRoom() {
     show("room"); $("room-name").textContent = state.roomID;
+    $("file-input").disabled = true;
     $("share").addEventListener("click", openShare);
     $("item-form").addEventListener("submit", addItem);
     $("items").addEventListener("click", itemAction);
@@ -153,7 +154,7 @@
       await refresh();
       show("file-drop", state.canWrite);
       if (state.room.encrypted) { await ensureDownloadWorker(); await prepareKey(); }
-      else { $("encryption-state").textContent = "Без шифрования"; renderItems(); }
+      else { $("encryption-state").textContent = "Без шифрования"; $("file-input").disabled = !state.canWrite; renderItems(); }
       connect();
     } catch (error) { message("room-error", error.message); $("item-text").disabled = true; $("send").disabled = true; }
   }
@@ -181,6 +182,7 @@
     const raw = await keyFromInput(value);
     if (await keyID(raw) !== state.room.keyId) throw new Error("Ключ не подходит к этой комнате");
     state.key = await importRawKey(raw); state.keyText = rawKeyText(raw);
+    $("file-input").disabled = !state.canWrite;
     $("encryption-state").textContent = "Сквозное шифрование включено";
     message("crypto-warning", "");
     await renderItems();
