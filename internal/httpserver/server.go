@@ -77,7 +77,9 @@ func (s *Server) page(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) asset(w http.ResponseWriter, r *http.Request) {
 	r.URL.Path = strings.TrimPrefix(path.Clean(r.URL.Path), "/assets")
-	w.Header().Set("Cache-Control", "public, max-age=86400")
+	// Asset URLs are stable across binary upgrades. Force revalidation so a
+	// browser cannot keep JavaScript from an older server version for a day.
+	w.Header().Set("Cache-Control", "no-cache, max-age=0, must-revalidate")
 	s.static.ServeHTTP(w, r)
 }
 

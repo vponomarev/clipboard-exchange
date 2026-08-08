@@ -146,4 +146,26 @@ func TestServesEmbeddedApplication(t *testing.T) {
 		}
 		resp.Body.Close()
 	}
+
+	resp, err := ts.Client().Get(ts.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(body, []byte(`/assets/app.js?v=2`)) {
+		t.Fatal("page does not cache-bust app.js")
+	}
+
+	resp, err = ts.Client().Get(ts.URL + "/assets/app.js?v=2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if got := resp.Header.Get("Cache-Control"); got != "no-cache, max-age=0, must-revalidate" {
+		t.Fatalf("unexpected asset cache policy: %q", got)
+	}
 }
