@@ -64,9 +64,10 @@ input:focus, textarea:focus { border-color:var(--accent); box-shadow:0 0 0 3px c
 .items { display:grid; gap:12px; }
 .item { overflow:hidden; }
 .item-content { margin:0; padding:17px 18px; overflow:auto; white-space:pre-wrap; overflow-wrap:anywhere; font:14px/1.55 ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace; }
+.item-content.collapsed { max-height:calc(3.1em + 34px); overflow:hidden; }
 .item-footer { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:8px 9px 8px 17px; border-top:1px solid var(--line); background:var(--surface-2); }
 .item-time { color:var(--muted); font-size:12px; }
-.item-buttons { display:flex; gap:6px; }
+.item-buttons { display:flex; flex-wrap:wrap; justify-content:flex-end; gap:6px; }
 .item-buttons .button { min-height:34px; padding:6px 11px; font-size:12px; }
 .delete { color:var(--danger) !important; }
 .empty { padding:45px 20px; text-align:center; color:var(--muted); border:1px dashed var(--line); border-radius:16px; }
@@ -95,6 +96,5 @@ dialog .dialog-card { position:relative; display:grid; gap:13px; padding:25px; }
   .input-action { flex-wrap:wrap; }
   .input-action > .button { flex:1; }
   #room-id { flex:1 1 100%; }
-  .item-footer { align-items:flex-start; }
+  .item-footer { align-items:flex-start; flex-wrap:wrap; }
 }
-

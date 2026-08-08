@@ -31,6 +31,31 @@ test("plain room preserves multiline text and updates another client", async ({ 
   await second.close();
 });
 
+test("long text is collapsed to two visual lines and can be expanded", async ({ page }) => {
+  const room = `collapse-${crypto.randomUUID()}`;
+  await page.goto("/");
+  await page.locator("#room-id").fill(room);
+  await page.getByRole("button", { name: "Создать комнату" }).click();
+
+  const exact = Array.from({ length: 8 }, (_, index) => `line ${index + 1}`).join("\n");
+  await page.locator("#item-text").fill(exact);
+  await page.getByRole("button", { name: "Добавить" }).click();
+
+  const content = page.locator(".item-content");
+  const expand = page.getByRole("button", { name: "Развернуть" });
+  await expect(expand).toBeVisible();
+  await expect(content).toHaveText(exact);
+  await expect(content).toHaveClass(/collapsed/);
+
+  await expand.click();
+  await expect(page.getByRole("button", { name: "Свернуть" })).toBeVisible();
+  await expect(content).not.toHaveClass(/collapsed/);
+
+  await page.getByRole("button", { name: "Свернуть" }).click();
+  await expect(page.getByRole("button", { name: "Развернуть" })).toBeVisible();
+  await expect(content).toHaveClass(/collapsed/);
+});
+
 test("encrypted room keeps plaintext out of the server response", async ({ page, request }) => {
   const room = `secure-${crypto.randomUUID()}`;
   await page.goto("/");

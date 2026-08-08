@@ -191,9 +191,11 @@
       const time = document.createElement("time"); time.className = "item-time"; time.dateTime = item.createdAt;
       time.textContent = new Intl.DateTimeFormat(undefined, { dateStyle:"medium", timeStyle:"short" }).format(new Date(item.createdAt));
       const buttons = document.createElement("div"); buttons.className = "item-buttons";
+      const toggle = document.createElement("button"); toggle.type = "button"; toggle.className = "button secondary hidden"; toggle.dataset.action = "toggle"; toggle.textContent = "Развернуть"; toggle.setAttribute("aria-expanded", "false");
       const copy = document.createElement("button"); copy.type = "button"; copy.className = "button secondary"; copy.dataset.action = "copy"; copy.textContent = "Копировать";
       const del = document.createElement("button"); del.type = "button"; del.className = "button secondary delete"; del.dataset.action = "delete"; del.textContent = "Удалить";
-      buttons.append(copy, del); footer.append(time, buttons); article.append(pre, footer); container.append(article);
+      buttons.append(toggle, copy, del); footer.append(time, buttons); article.append(pre, footer); container.append(article);
+      updateItemOverflow(article);
     }
     show("empty", state.items.length === 0);
     if (failures) message("room-error", `${failures} записей не удалось расшифровать`);
@@ -202,6 +204,14 @@
   async function itemAction(event) {
     const button = event.target.closest("button[data-action]"); if (!button) return;
     const article = button.closest(".item");
+    if (button.dataset.action === "toggle") {
+      const pre = article.querySelector("pre");
+      const expanded = pre.classList.contains("collapsed");
+      pre.classList.toggle("collapsed", !expanded);
+      button.textContent = expanded ? "Свернуть" : "Развернуть";
+      button.setAttribute("aria-expanded", String(expanded));
+      return;
+    }
     if (button.dataset.action === "copy") { await copyText(article.querySelector("pre").textContent); toast("Текст скопирован"); return; }
     if (button.dataset.action === "delete") {
       button.disabled = true;
@@ -209,6 +219,24 @@
       catch (error) { message("room-error", error.message); button.disabled = false; }
     }
   }
+
+  function updateItemOverflow(article) {
+    const pre = article.querySelector(".item-content");
+    const toggle = article.querySelector('[data-action="toggle"]');
+    const expanded = toggle.getAttribute("aria-expanded") === "true";
+    pre.classList.add("collapsed");
+    const overflowing = pre.scrollHeight > pre.clientHeight + 1;
+    toggle.classList.toggle("hidden", !overflowing);
+    if (!overflowing) {
+      pre.classList.remove("collapsed");
+      toggle.textContent = "Развернуть";
+      toggle.setAttribute("aria-expanded", "false");
+    } else if (expanded) {
+      pre.classList.remove("collapsed");
+    }
+  }
+
+  addEventListener("resize", () => document.querySelectorAll(".item").forEach(updateItemOverflow));
 
   function connect() {
     const protocol = location.protocol === "https:" ? "wss:" : "ws:";
