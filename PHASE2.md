@@ -72,14 +72,10 @@ capability без аккаунтов и администратора комна�
 
 ### Обратная совместимость
 
-Существующие комнаты не имеют write capability и остаются в legacy R/W-режиме:
-room ID продолжает разрешать изменения. Без прежнего секрета сервер не может
-безопасно назначить первого владельца и автоматически превратить такую комнату в
-защищённую.
-
-Все новые комнаты создаются в capability-режиме. Для переноса legacy room в новую
-модель пользователь создаёт новую комнату и переносит нужные записи. Возможный
-отдельный admin-assisted migration не входит в публичный API.
+Миграция ранней схемы комнат не выполняется. Перед первым запуском версии с
+capability-моделью оператор архивирует прежнюю SQLite и запускает сервер с пустой
+БД. Старый формат encrypted item v1 остаётся поддержан в клиентском протоколе, но
+перенос существующей БД в новую схему не входит в фазу 2.
 
 ## Добровольный alias
 
@@ -112,7 +108,7 @@ room ID продолжает разрешать изменения. Без пр�
   полученные чанки, срок действия и encryption metadata;
 - `files`: file ID, room ID, storage object, размеры, chunk layout, manifest,
   key ID, protocol version и timestamps;
-- `rooms`: nullable write capability hash и access-mode version;
+- `rooms`: обязательный write capability hash и access-mode version;
 - текстовые items: alias для open payload либо alias внутри encrypted v2 payload;
 - связь завершённого файла с общей timeline комнаты.
 
@@ -169,8 +165,10 @@ unavailable. Для mutation access добавляются `write_capability_req
   рядом с ciphertext; клиент и сервер отклоняют повтор nonce внутри upload session.
 - AAD включает protocol version, room ID, file ID, chunk index и plaintext size.
 - Manifest с исходным именем, MIME type, точным размером и chunk layout шифруется
-  отдельно. Последний plaintext chunk перед шифрованием дополняется случайными
-  байтами до negotiated chunk size; реальная длина берётся только из manifest.
+  отдельно. Последний plaintext chunk перед шифрованием дополняется нулями до
+  negotiated chunk size; AES-GCM с уникальным nonce скрывает padding, а
+  детерминированный plaintext позволяет проверить digest при resume. Реальная длина
+  берётся только из encrypted manifest.
 - Сервер проверяет `keyId`, envelope structure, размеры и число чанков, но не видит
   plaintext.
 - В репозитории публикуются test vectors для Web UI и будущих Android/macOS
@@ -287,7 +285,8 @@ file storage.
 - Encrypted room скрывает имя, MIME type, исходный размер и содержимое от сервера.
 - Ошибочный ключ, повреждённый или переставленный chunk не создаёт повреждённый
   plaintext-файл.
-- Старые текстовые комнаты и клиенты продолжают работать после миграции.
+- Чистый запуск после архивирования legacy-БД создаёт новую capability-схему; попытка
+  открыть прежнюю схему завершается явной ошибкой без изменения данных.
 - Chrome, Firefox и Android browser tests проходят в CI; выполнена ручная проверка
   на реальных устройствах.
 - Systemd install, upgrade, rollback, deinstall и purge учитывают file storage.

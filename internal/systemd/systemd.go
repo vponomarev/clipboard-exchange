@@ -48,6 +48,7 @@ func Run(args []string, version string) error {
 func install(args []string, version string) error {
 	cfg := config.Default()
 	cfg.DatabasePath = filepath.Join(dataDir, "data.db")
+	cfg.FilesDir = filepath.Join(dataDir, "files")
 	fs := flag.NewFlagSet("install", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	config.BindFlags(fs, &cfg)
@@ -62,6 +63,9 @@ func install(args []string, version string) error {
 	}
 	if filepath.Clean(cfg.DatabasePath) != filepath.Join(dataDir, "data.db") {
 		return fmt.Errorf("systemd installation requires database path %s", filepath.Join(dataDir, "data.db"))
+	}
+	if filepath.Clean(cfg.FilesDir) != filepath.Join(dataDir, "files") {
+		return fmt.Errorf("systemd installation requires files directory %s", filepath.Join(dataDir, "files"))
 	}
 	if _, err := os.Stat(binaryPath); err == nil {
 		return errors.New("already installed; use a newly downloaded binary with the upgrade command")
@@ -131,6 +135,9 @@ func upgrade(args []string, version string) error {
 		return err
 	}
 	if err := writeAtomic(unitPath, []byte(unitFile()), 0o644); err != nil {
+		return rollback(err)
+	}
+	if err := addFileStorageEnvironment(); err != nil {
 		return rollback(err)
 	}
 	if err := command("systemctl", "daemon-reload"); err != nil {
@@ -240,6 +247,12 @@ func environmentFile(cfg config.Config) string {
 		{"CLIPBOARD_EXCHANGE_MAX_ROOMS", strconv.Itoa(cfg.MaxRooms)},
 		{"CLIPBOARD_EXCHANGE_RATE_LIMIT", strconv.Itoa(cfg.RateLimit)},
 		{"CLIPBOARD_EXCHANGE_TRUST_PROXY", strconv.FormatBool(cfg.TrustProxy)},
+		{"CLIPBOARD_EXCHANGE_FILES_DIR", cfg.FilesDir},
+		{"CLIPBOARD_EXCHANGE_MAX_FILE_BYTES", strconv.FormatInt(cfg.MaxFileBytes, 10)},
+		{"CLIPBOARD_EXCHANGE_MAX_ROOM_FILE_BYTES", strconv.FormatInt(cfg.MaxRoomFileBytes, 10)},
+		{"CLIPBOARD_EXCHANGE_FILE_CHUNK_BYTES", strconv.FormatInt(cfg.FileChunkBytes, 10)},
+		{"CLIPBOARD_EXCHANGE_UPLOAD_TTL", cfg.UploadTTL.String()},
+		{"CLIPBOARD_EXCHANGE_MAX_ACTIVE_UPLOADS", strconv.Itoa(cfg.MaxActiveUploads)},
 	}
 	var out strings.Builder
 	out.WriteString("# Managed initially by clipboard-exchange install; safe to edit.\n")
@@ -247,6 +260,33 @@ func environmentFile(cfg config.Config) string {
 		fmt.Fprintf(&out, "%s=%s\n", value[0], strconv.Quote(value[1]))
 	}
 	return out.String()
+}
+
+func addFileStorageEnvironment() error {
+	content, err := os.ReadFile(configPath)
+	if err != nil {
+		return err
+	}
+	cfg := config.Default()
+	cfg.FilesDir = filepath.Join(dataDir, "files")
+	values := [][2]string{
+		{"CLIPBOARD_EXCHANGE_FILES_DIR", cfg.FilesDir},
+		{"CLIPBOARD_EXCHANGE_MAX_FILE_BYTES", strconv.FormatInt(cfg.MaxFileBytes, 10)},
+		{"CLIPBOARD_EXCHANGE_MAX_ROOM_FILE_BYTES", strconv.FormatInt(cfg.MaxRoomFileBytes, 10)},
+		{"CLIPBOARD_EXCHANGE_FILE_CHUNK_BYTES", strconv.FormatInt(cfg.FileChunkBytes, 10)},
+		{"CLIPBOARD_EXCHANGE_UPLOAD_TTL", cfg.UploadTTL.String()},
+		{"CLIPBOARD_EXCHANGE_MAX_ACTIVE_UPLOADS", strconv.Itoa(cfg.MaxActiveUploads)},
+	}
+	text := string(content)
+	for _, value := range values {
+		if !strings.Contains(text, "\n"+value[0]+"=") && !strings.HasPrefix(text, value[0]+"=") {
+			if text != "" && !strings.HasSuffix(text, "\n") {
+				text += "\n"
+			}
+			text += value[0] + "=" + strconv.Quote(value[1]) + "\n"
+		}
+	}
+	return writeAtomic(configPath, []byte(text), 0o640)
 }
 
 func command(name string, args ...string) error {

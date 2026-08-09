@@ -37,7 +37,7 @@ jobs:
         run: |
           mkdir -p dist/clipboard-exchange-linux-amd64
           go build -trimpath -ldflags="-s -w -X main.version=${GITHUB_REF_NAME}" -o dist/clipboard-exchange-linux-amd64/clipboard-exchange ./cmd/clipboard-exchange
-          cp README.md THIRD_PARTY_NOTICES.md dist/clipboard-exchange-linux-amd64/
+          cp README.md PROTOCOL.md THIRD_PARTY_NOTICES.md dist/clipboard-exchange-linux-amd64/
           tar -C dist -czf dist/clipboard-exchange-linux-amd64.tar.gz clipboard-exchange-linux-amd64
           cd dist && sha256sum clipboard-exchange-linux-amd64.tar.gz > checksums.txt
       - name: Publish GitHub Release

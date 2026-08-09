@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/vponomarev/clipboard-exchange/internal/config"
+	"github.com/vponomarev/clipboard-exchange/internal/filestore"
 	"github.com/vponomarev/clipboard-exchange/internal/httpserver"
 	"github.com/vponomarev/clipboard-exchange/internal/store"
 	"github.com/vponomarev/clipboard-exchange/internal/systemd"
@@ -53,8 +54,13 @@ func main() {
 		os.Exit(1)
 	}
 	defer db.Close()
+	files, err := filestore.Open(cfg.FilesDir)
+	if err != nil {
+		log.Printf("open file storage: %v", err)
+		os.Exit(1)
+	}
 
-	handler := httpserver.New(cfg, db, log.Default())
+	handler := httpserver.New(cfg, db, files, log.Default())
 	httpServer := &http.Server{
 		Addr:              cfg.Listen,
 		Handler:           handler,
@@ -67,6 +73,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go db.RunCleanup(ctx, cfg.RoomTTL, time.Hour)
+	go runUploadCleanup(ctx, db, files)
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -92,5 +99,39 @@ func main() {
 	defer cancel()
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
 		log.Printf("graceful shutdown: %v", err)
+	}
+}
+
+func runUploadCleanup(ctx context.Context, db *store.Store, files *filestore.Store) {
+	cleanup := func() {
+		ids, err := db.DeleteExpiredUploads(ctx, time.Now())
+		if err != nil {
+			log.Printf("cleanup expired uploads: %v", err)
+			return
+		}
+		for _, id := range ids {
+			if err := files.RemoveUpload(id); err != nil {
+				log.Printf("cleanup upload %s: %v", id, err)
+			}
+		}
+		activeUploads, activeObjects, err := db.StorageReferences(ctx)
+		if err != nil {
+			log.Printf("read file storage references: %v", err)
+			return
+		}
+		if err := files.Reconcile(activeUploads, activeObjects); err != nil {
+			log.Printf("reconcile file storage: %v", err)
+		}
+	}
+	cleanup()
+	ticker := time.NewTicker(time.Hour)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			cleanup()
+		}
 	}
 }
