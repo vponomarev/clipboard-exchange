@@ -1,9 +1,21 @@
-# Clipboard Exchange protocol v2
+# Clipboard Exchange protocol v3
 
 `GET /api/capabilities` — источник negotiated limits и поддержанных версий.
 Клиент не должен считать настроечные значения сервера равными defaults.
 
 ## Capability tokens
+
+При создании комнаты поле `writeProtected` выбирает модель доступа:
+
+- `false`: обычная R/W-комната; `writeToken` должен быть пустым, mutations не
+  требуют `Authorization`;
+- `true`: комната с разделением прав; требуется корректный `writeToken`, а без
+  него ссылка является R/O.
+
+Для совместимости с клиентами protocol v2 отсутствие `writeProtected` означает
+защищённую комнату, если передан `writeToken`. `GET /api/rooms/{room}` возвращает
+фактическое значение `room.writeProtected`. Capabilities protocol v3 публикует
+`openWriteRooms: true`.
 
 - write token: `cw1_` + 32 random bytes в unpadded base64url;
 - upload token: `cu1_` + 32 random bytes в unpadded base64url;

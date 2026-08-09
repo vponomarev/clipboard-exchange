@@ -8,7 +8,33 @@ test("HTTP-compatible UUID fallback initializes the page and honors room query",
   await page.goto(`/?room=${room}`);
   await expect(page.locator("#room-id")).toHaveValue(room);
   await page.getByRole("button", { name: "Создать комнату" }).click();
+  await expect(page).toHaveURL(new RegExp(`/r/${room}$`));
+});
+
+test("protected room exposes separate read-only and read-write links", async ({ page, browser }) => {
+  const room = `protected-${crypto.randomUUID()}`;
+  await page.goto("/");
+  await page.locator("#room-id").fill(room);
+  await page.locator("#write-protected").check();
+  await page.getByRole("button", { name: "Создать комнату" }).click();
   await expect(page).toHaveURL(new RegExp(`/r/${room}#.*write=cw1_`));
+
+  const readerContext = await browser.newContext();
+  const reader = await readerContext.newPage();
+  await reader.goto(`/r/${room}`);
+  await expect(reader.locator("#item-form")).toBeHidden();
+  const denied = await reader.evaluate(async roomID => (await fetch(`/api/rooms/${roomID}/items`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id: crypto.randomUUID(), kind: "text", content: "denied" })
+  })).status, room);
+  expect(denied).toBe(403);
+
+  await page.getByRole("button", { name: "Поделиться" }).click();
+  await expect(page.locator("#share-url")).not.toHaveValue(/write=cw1_/);
+  await page.getByText("R/W", { exact: true }).click();
+  await expect(page.locator("#share-url")).toHaveValue(/write=cw1_/);
+  await readerContext.close();
 });
 
 test("plain room preserves multiline text and updates another client", async ({ page, browser }) => {
@@ -16,7 +42,7 @@ test("plain room preserves multiline text and updates another client", async ({ 
   await page.goto("/");
   await page.locator("#room-id").fill(room);
   await page.getByRole("button", { name: "Создать комнату" }).click();
-  await expect(page).toHaveURL(new RegExp(`/r/${room}#.*write=cw1_`));
+  await expect(page).toHaveURL(new RegExp(`/r/${room}$`));
 
   const secondContext = await browser.newContext();
   const second = await secondContext.newPage();
@@ -27,19 +53,11 @@ test("plain room preserves multiline text and updates another client", async ({ 
   await page.getByRole("button", { name: "Добавить", exact: true }).click();
   await expect(second.locator(".item-content")).toHaveText(exact);
   await expect(second.locator(".item-alias")).toHaveText("Вася");
-  await expect(second.locator("#item-form")).toBeHidden();
-  await expect(second.locator(".delete")).toHaveCount(0);
+  await expect(second.locator("#item-form")).toBeVisible();
+  await expect(second.locator(".delete")).toHaveCount(1);
   await expect(second.getByText("В сети")).toBeVisible();
-
-  const denied = await second.evaluate(async roomID => (await fetch(`/api/rooms/${roomID}/items`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ id: crypto.randomUUID(), kind: "text", content: "denied" })
-  })).status, room);
-  expect(denied).toBe(403);
-
-  await page.locator(".delete").click();
-  await expect(second.locator(".item")).toHaveCount(0);
+  await second.locator(".delete").click();
+  await expect(page.locator(".item")).toHaveCount(0);
   await secondContext.close();
 });
 
@@ -68,12 +86,13 @@ test("long text is collapsed to two visual lines and can be expanded", async ({ 
   await expect(content).toHaveClass(/collapsed/);
 });
 
-test("open file uploads in chunks and is available to a read-only client", async ({ page, request }) => {
+test("open file uploads in chunks and can be deleted by another room participant", async ({ page, request }) => {
   const room = `file-${crypto.randomUUID()}`;
   await page.goto("/");
   await page.locator("#room-id").fill(room);
   await page.getByRole("button", { name: "Создать комнату" }).click();
   await page.locator("#alias").fill("Вася");
+  await expect(page.locator("#file-input")).toBeEnabled();
   const content = Buffer.from("first line\nsecond line\n", "utf8");
   await page.locator("#file-input").setInputFiles({ name: "script $HOME.txt", mimeType: "text/plain", buffer: content });
   await expect(page.locator(".file-item .file-name")).toHaveText("script $HOME.txt");
@@ -84,13 +103,13 @@ test("open file uploads in chunks and is available to a read-only client", async
   const downloaded = await request.get(`/api/rooms/${room}/files/${data.files[0].id}`);
   expect(await downloaded.body()).toEqual(content);
 
-  const readOnly = await page.context().newPage();
-  await readOnly.goto(`/r/${room}`);
-  await expect(readOnly.locator(".file-item .file-name")).toHaveText("script $HOME.txt");
-  await expect(readOnly.locator(".file-item .delete")).toHaveCount(0);
-  await readOnly.close();
-  await page.locator(".file-item .delete").click();
+  const participant = await page.context().newPage();
+  await participant.goto(`/r/${room}`);
+  await expect(participant.locator(".file-item .file-name")).toHaveText("script $HOME.txt");
+  await expect(participant.locator(".file-item .delete")).toHaveCount(1);
+  await participant.locator(".file-item .delete").click();
   await expect(page.locator(".file-item")).toHaveCount(0);
+  await participant.close();
 });
 
 test("interrupted upload resumes after reload and verifies completed chunks", async ({ page, request }) => {
@@ -99,13 +118,14 @@ test("interrupted upload resumes after reload and verifies completed chunks", as
   await page.goto("/");
   await page.locator("#room-id").fill(room);
   await page.getByRole("button", { name:"Создать комнату" }).click();
-  await expect(page).toHaveURL(new RegExp(`/r/${room}#`));
+  await expect(page).toHaveURL(new RegExp(`/r/${room}$`));
   let interrupted = false;
   await page.route("**/chunks/1", async route => {
     if (!interrupted) { interrupted = true; await route.abort("connectionrefused"); }
     else await route.continue();
   });
   const selected = { name:"resume.bin", mimeType:"application/octet-stream", buffer:content };
+  await expect(page.locator("#file-input")).toBeEnabled();
   await page.locator("#file-input").setInputFiles(selected);
   await expect(page.locator(".upload-row .muted")).toContainText("Ошибка");
   await page.reload();
@@ -129,7 +149,7 @@ test("encrypted room keeps plaintext out of the server response", async ({ page,
   expect(await page.evaluate(() => {
     const params = new URLSearchParams(location.hash.slice(1));
     return { key: params.get("key"), write: params.get("write") };
-  })).toMatchObject({ key: expect.stringMatching(/^ce1_/), write: expect.stringMatching(/^cw1_/) });
+  })).toMatchObject({ key: expect.stringMatching(/^ce1_/), write: null });
 
   const secret = "ssh root@internal\nexport TOKEN=do-not-leak";
   const secretAlias = "Секретный Вася";
@@ -197,6 +217,7 @@ test("encrypted upload resumes without retransmitting a verified chunk", async (
     else await route.continue();
   });
   const selected = { name:"encrypted-resume.bin", mimeType:"application/octet-stream", buffer:content };
+  await expect(page.locator("#file-input")).toBeEnabled();
   await page.locator("#file-input").setInputFiles(selected);
   await expect(page.locator(".upload-row .muted")).toContainText("Ошибка");
   await page.reload();

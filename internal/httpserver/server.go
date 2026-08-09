@@ -111,20 +111,30 @@ func (s *Server) createRoom(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		ID         string `json:"id"`
-		Encrypted  bool   `json:"encrypted"`
-		KeyID      string `json:"keyId"`
-		WriteToken string `json:"writeToken"`
+		ID             string `json:"id"`
+		Encrypted      bool   `json:"encrypted"`
+		KeyID          string `json:"keyId"`
+		WriteProtected *bool  `json:"writeProtected"`
+		WriteToken     string `json:"writeToken"`
 	}
 	if !decodeJSON(w, r, &req, 4096) {
 		return
 	}
-	writeHash, validWriteToken := hashWriteToken(req.WriteToken)
+	// A missing writeProtected field preserves compatibility with v2 clients,
+	// which always supplied a write token.
+	writeProtected := req.WriteToken != ""
+	if req.WriteProtected != nil {
+		writeProtected = *req.WriteProtected
+	}
+	writeHash, validWriteToken := "", req.WriteToken == ""
+	if writeProtected {
+		writeHash, validWriteToken = hashWriteToken(req.WriteToken)
+	}
 	if !roomIDPattern.MatchString(req.ID) || !validWriteToken || (req.Encrypted && !validToken(req.KeyID, 43, 64)) || (!req.Encrypted && req.KeyID != "") {
 		writeError(w, http.StatusBadRequest, "invalid_room", "Room ID or encryption metadata is invalid")
 		return
 	}
-	err := s.store.CreateRoom(r.Context(), store.Room{ID: req.ID, Encrypted: req.Encrypted, KeyID: req.KeyID, WriteHash: writeHash}, s.cfg.MaxRooms)
+	err := s.store.CreateRoom(r.Context(), store.Room{ID: req.ID, Encrypted: req.Encrypted, KeyID: req.KeyID, WriteProtected: writeProtected, WriteHash: writeHash}, s.cfg.MaxRooms)
 	if err != nil {
 		s.storeError(w, err)
 		return
@@ -135,8 +145,9 @@ func (s *Server) createRoom(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) capabilities(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
-		"protocolVersion":        2,
+		"protocolVersion":        3,
 		"writeCapabilities":      true,
+		"openWriteRooms":         true,
 		"aliases":                true,
 		"encryptedTextVersions":  []int{1, 2},
 		"files":                  true,
@@ -240,6 +251,15 @@ func (s *Server) rotateWriteCapability(w http.ResponseWriter, r *http.Request) {
 	roomID := r.PathValue("room")
 	if !roomIDPattern.MatchString(roomID) {
 		writeError(w, http.StatusBadRequest, "invalid_room", "Invalid room ID")
+		return
+	}
+	room, err := s.store.GetRoom(r.Context(), roomID)
+	if err != nil {
+		s.storeError(w, err)
+		return
+	}
+	if !room.WriteProtected {
+		writeError(w, http.StatusConflict, "write_capability_disabled", "This room does not use a write capability")
 		return
 	}
 	currentHash, ok := s.authorizeMutationHash(w, r, roomID)
@@ -577,6 +597,14 @@ func (s *Server) authorizeMutation(w http.ResponseWriter, r *http.Request, roomI
 func (s *Server) authorizeMutationHash(w http.ResponseWriter, r *http.Request, roomID string) (string, bool) {
 	if !s.allowMutation(w, r) {
 		return "", false
+	}
+	room, err := s.store.GetRoom(r.Context(), roomID)
+	if err != nil {
+		s.storeError(w, err)
+		return "", false
+	}
+	if !room.WriteProtected {
+		return "", true
 	}
 	const prefix = "ClipboardWrite "
 	header := r.Header.Get("Authorization")

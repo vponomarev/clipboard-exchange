@@ -48,7 +48,7 @@ func TestRoomAndExactMultilineText(t *testing.T) {
 func TestWriteAuthorizationAndRotation(t *testing.T) {
 	s := testStore(t)
 	ctx := context.Background()
-	if err := s.CreateRoom(ctx, Room{ID: "rights", WriteHash: "hash-one"}, 10); err != nil {
+	if err := s.CreateRoom(ctx, Room{ID: "rights", WriteProtected: true, WriteHash: "hash-one"}, 10); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.AuthorizeWrite(ctx, "rights", "wrong"); !errors.Is(err, ErrForbidden) {
@@ -65,6 +65,50 @@ func TestWriteAuthorizationAndRotation(t *testing.T) {
 	}
 	if err := s.AuthorizeWrite(ctx, "rights", "hash-two"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestOpenWriteRoomDoesNotUseCapability(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	if err := s.CreateRoom(ctx, Room{ID: "open"}, 10); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AuthorizeWrite(ctx, "open", ""); err != nil {
+		t.Fatalf("open room rejected mutation: %v", err)
+	}
+	if err := s.RotateWriteHash(ctx, "open", "", "hash"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("open room allowed capability rotation: %v", err)
+	}
+}
+
+func TestVersionTwoRoomsMigrateAsWriteProtected(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "v2.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE rooms (
+		id TEXT PRIMARY KEY,
+		encrypted INTEGER NOT NULL,
+		key_id TEXT NOT NULL DEFAULT '',
+		write_hash TEXT NOT NULL,
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL
+	); INSERT INTO rooms VALUES ('existing',0,'','hash','created','updated'); PRAGMA user_version=2`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	room, err := s.GetRoom(context.Background(), "existing")
+	if err != nil || !room.WriteProtected {
+		t.Fatalf("migrated room: %#v err=%v", room, err)
 	}
 }
 
