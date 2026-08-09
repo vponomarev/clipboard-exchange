@@ -41,7 +41,15 @@ async function streamDownload(config) {
     }
   });
   const filename = encodeURIComponent(config.name).replace(/[!'()*]/g, value => `%${value.charCodeAt(0).toString(16).toUpperCase()}`);
-  return new Response(stream, { headers:{ "Content-Type":config.mimeType || "application/octet-stream", "Content-Length":String(config.size), "Content-Disposition":`attachment; filename*=UTF-8''${filename}`, "Cache-Control":"no-store" } });
+  const disposition = config.disposition === "inline" && canPreview(config.mimeType) ? "inline" : "attachment";
+  return new Response(stream, { headers:{ "Content-Type":config.mimeType || "application/octet-stream", "Content-Length":String(config.size), "Content-Disposition":`${disposition}; filename*=UTF-8''${filename}`, "Cache-Control":"no-store" } });
+}
+
+function canPreview(value) {
+  const mediaType = String(value || "").split(";", 1)[0].trim().toLowerCase();
+  if (mediaType.startsWith("audio/") || mediaType.startsWith("video/")) return true;
+  if (mediaType.startsWith("image/") && mediaType !== "image/svg+xml") return true;
+  return ["text/plain", "text/csv", "application/json", "application/pdf"].includes(mediaType);
 }
 
 function fromB64url(value) {

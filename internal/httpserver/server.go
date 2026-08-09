@@ -71,6 +71,7 @@ func New(cfg config.Config, db *store.Store, files *filestore.Store, logger *log
 	mux.HandleFunc("DELETE /api/rooms/{room}/uploads/{upload}", s.abortUpload)
 	mux.HandleFunc("GET /api/rooms/{room}/files/{file}", s.downloadFile)
 	mux.HandleFunc("DELETE /api/rooms/{room}/files/{file}", s.deleteFile)
+	mux.HandleFunc("DELETE /api/rooms/{room}/entries/{entry}", s.deleteEntry)
 	mux.HandleFunc("POST /api/rooms/{room}/items", s.addItem)
 	mux.HandleFunc("DELETE /api/rooms/{room}/items/{item}", s.deleteItem)
 	mux.HandleFunc("GET /api/rooms/{room}/events", s.events)
@@ -145,9 +146,11 @@ func (s *Server) createRoom(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) capabilities(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
-		"protocolVersion":        3,
+		"protocolVersion":        4,
 		"writeCapabilities":      true,
 		"openWriteRooms":         true,
+		"groupedAttachments":     true,
+		"inlineFiles":            true,
 		"aliases":                true,
 		"encryptedTextVersions":  []int{1, 2},
 		"files":                  true,
@@ -300,12 +303,14 @@ func (s *Server) createUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Name      string `json:"name"`
-		MIMEType  string `json:"mimeType"`
-		Alias     string `json:"alias"`
-		Size      int64  `json:"size"`
-		Encrypted bool   `json:"encrypted"`
-		KeyID     string `json:"keyId"`
+		Name       string `json:"name"`
+		MIMEType   string `json:"mimeType"`
+		Alias      string `json:"alias"`
+		EntryID    string `json:"entryId"`
+		EntryIndex int    `json:"entryIndex"`
+		Size       int64  `json:"size"`
+		Encrypted  bool   `json:"encrypted"`
+		KeyID      string `json:"keyId"`
 	}
 	if !decodeJSON(w, r, &req, 4096) {
 		return
@@ -318,7 +323,7 @@ func (s *Server) createUpload(w http.ResponseWriter, r *http.Request) {
 		validMetadata = req.Encrypted && req.KeyID == room.KeyID && req.Name == "" && req.MIMEType == "" && req.Alias == "" && req.Size > 0 && req.Size%chunkSize == 0
 		chunkCount = int(req.Size / chunkSize)
 	}
-	if !validMetadata || req.Size < 0 || req.Size > s.cfg.MaxFileBytes {
+	if !validMetadata || req.EntryIndex < 0 || req.EntryIndex > 999 || req.Size < 0 || req.Size > s.cfg.MaxFileBytes {
 		writeError(w, http.StatusBadRequest, "invalid_file", "Invalid file metadata or size")
 		return
 	}
@@ -330,6 +335,14 @@ func (s *Server) createUpload(w http.ResponseWriter, r *http.Request) {
 	fileID, err := randomID()
 	if err != nil {
 		s.storeError(w, err)
+		return
+	}
+	entryID := req.EntryID
+	if entryID == "" {
+		// Compatibility with clients that predate grouped attachments.
+		entryID = fileID
+	} else if !objectIDPattern.MatchString(entryID) {
+		writeError(w, http.StatusBadRequest, "invalid_entry", "Invalid entry ID")
 		return
 	}
 	token, err := newOpaqueToken("cu1_")
@@ -344,7 +357,7 @@ func (s *Server) createUpload(w http.ResponseWriter, r *http.Request) {
 			chunkCount = 1
 		}
 	}
-	upload := store.Upload{ID: uploadID, RoomID: roomID, FileID: fileID, Name: req.Name, MIMEType: req.MIMEType, Alias: req.Alias, Size: req.Size, ChunkSize: chunkSize, PlainChunkSize: s.cfg.FileChunkBytes, ChunkCount: chunkCount, Encrypted: req.Encrypted, KeyID: req.KeyID, TokenHash: tokenHash, ExpiresAt: time.Now().Add(s.cfg.UploadTTL).UTC().Format(time.RFC3339Nano)}
+	upload := store.Upload{ID: uploadID, RoomID: roomID, FileID: fileID, EntryID: entryID, EntryIndex: req.EntryIndex, Name: req.Name, MIMEType: req.MIMEType, Alias: req.Alias, Size: req.Size, ChunkSize: chunkSize, PlainChunkSize: s.cfg.FileChunkBytes, ChunkCount: chunkCount, Encrypted: req.Encrypted, KeyID: req.KeyID, TokenHash: tokenHash, ExpiresAt: time.Now().Add(s.cfg.UploadTTL).UTC().Format(time.RFC3339Nano)}
 	if err := s.store.CreateUpload(r.Context(), upload, s.cfg.MaxRoomFileBytes, s.cfg.MaxActiveUploads); errors.Is(err, store.ErrLimit) {
 		writeError(w, http.StatusConflict, "quota_exceeded", "File quota or active upload limit reached")
 		return
@@ -352,7 +365,7 @@ func (s *Server) createUpload(w http.ResponseWriter, r *http.Request) {
 		s.storeError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]any{"id": upload.ID, "fileId": upload.FileID, "uploadToken": token, "chunkSize": upload.ChunkSize, "plainChunkSize": upload.PlainChunkSize, "chunkCount": upload.ChunkCount, "encrypted": upload.Encrypted, "keyId": upload.KeyID, "expiresAt": upload.ExpiresAt, "received": []int{}, "digests": map[int]string{}})
+	writeJSON(w, http.StatusCreated, map[string]any{"id": upload.ID, "fileId": upload.FileID, "entryId": upload.EntryID, "entryIndex": upload.EntryIndex, "uploadToken": token, "chunkSize": upload.ChunkSize, "plainChunkSize": upload.PlainChunkSize, "chunkCount": upload.ChunkCount, "encrypted": upload.Encrypted, "keyId": upload.KeyID, "expiresAt": upload.ExpiresAt, "received": []int{}, "digests": map[int]string{}})
 }
 
 func (s *Server) getUpload(w http.ResponseWriter, r *http.Request) {
@@ -508,7 +521,11 @@ func (s *Server) downloadFile(w http.ResponseWriter, r *http.Request) {
 		contentType, filename = "application/octet-stream", file.ID+".cex"
 	}
 	w.Header().Set("Content-Type", contentType)
-	w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": filename}))
+	disposition := "attachment"
+	if r.URL.Query().Get("inline") == "1" && !file.Encrypted && inlineMIMEType(file.MIMEType) {
+		disposition = "inline"
+	}
+	w.Header().Set("Content-Disposition", mime.FormatMediaType(disposition, map[string]string{"filename": filename}))
 	w.Header().Set("ETag", `"`+file.ID+`"`)
 	w.Header().Set("Cache-Control", "private, no-store")
 	http.ServeContent(w, r, file.Name, created, object)
@@ -529,6 +546,29 @@ func (s *Server) deleteFile(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := s.files.RemoveObject(fileID); err != nil {
 		s.log.Printf("remove stored file %s: %v", fileID, err)
+	}
+	s.hub.broadcast(roomID)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) deleteEntry(w http.ResponseWriter, r *http.Request) {
+	roomID, entryID := r.PathValue("room"), r.PathValue("entry")
+	if !roomIDPattern.MatchString(roomID) || !objectIDPattern.MatchString(entryID) {
+		writeError(w, http.StatusBadRequest, "invalid_entry", "Invalid room or entry ID")
+		return
+	}
+	if !s.authorizeMutation(w, r, roomID) {
+		return
+	}
+	fileIDs, err := s.store.DeleteEntry(r.Context(), roomID, entryID)
+	if err != nil {
+		s.storeError(w, err)
+		return
+	}
+	for _, fileID := range fileIDs {
+		if err := s.files.RemoveObject(fileID); err != nil {
+			s.log.Printf("remove entry file object: %v", err)
+		}
 	}
 	s.hub.broadcast(roomID)
 	w.WriteHeader(http.StatusNoContent)
@@ -794,6 +834,25 @@ func validMIMEType(value string) bool {
 	}
 	_, _, err := mime.ParseMediaType(value)
 	return err == nil
+}
+
+func inlineMIMEType(value string) bool {
+	mediaType, _, err := mime.ParseMediaType(value)
+	if err != nil {
+		return false
+	}
+	if strings.HasPrefix(mediaType, "audio/") || strings.HasPrefix(mediaType, "video/") {
+		return true
+	}
+	if strings.HasPrefix(mediaType, "image/") {
+		return mediaType != "image/svg+xml"
+	}
+	switch mediaType {
+	case "text/plain", "text/csv", "application/json", "application/pdf":
+		return true
+	default:
+		return false
+	}
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
