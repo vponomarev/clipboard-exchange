@@ -112,6 +112,55 @@ func TestVersionTwoRoomsMigrateAsWriteProtected(t *testing.T) {
 	}
 }
 
+func TestVersionThreeFilesMigrateToIndependentEntries(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "v3.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE rooms (
+		id TEXT PRIMARY KEY, encrypted INTEGER NOT NULL, key_id TEXT NOT NULL DEFAULT '',
+		write_hash TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+		write_protected INTEGER NOT NULL DEFAULT 1
+	);
+	CREATE TABLE uploads (
+		id TEXT PRIMARY KEY, room_id TEXT NOT NULL, file_id TEXT NOT NULL UNIQUE,
+		name TEXT NOT NULL, mime_type TEXT NOT NULL, alias TEXT NOT NULL DEFAULT '', size INTEGER NOT NULL,
+		chunk_size INTEGER NOT NULL, chunk_count INTEGER NOT NULL, plain_chunk_size INTEGER NOT NULL,
+		encrypted INTEGER NOT NULL DEFAULT 0, key_id TEXT NOT NULL DEFAULT '', token_hash TEXT NOT NULL,
+		expires_at TEXT NOT NULL, created_at TEXT NOT NULL
+	);
+	CREATE TABLE files (
+		id TEXT PRIMARY KEY, room_id TEXT NOT NULL, name TEXT NOT NULL, mime_type TEXT NOT NULL,
+		alias TEXT NOT NULL DEFAULT '', size INTEGER NOT NULL, encrypted INTEGER NOT NULL DEFAULT 0,
+		key_id TEXT NOT NULL DEFAULT '', manifest_ciphertext TEXT NOT NULL DEFAULT '', manifest_iv TEXT NOT NULL DEFAULT '',
+		version INTEGER NOT NULL DEFAULT 0, chunk_size INTEGER NOT NULL DEFAULT 0, chunk_count INTEGER NOT NULL DEFAULT 0,
+		created_at TEXT NOT NULL
+	);
+	INSERT INTO rooms VALUES ('room',0,'','hash','now','now',1);
+	INSERT INTO uploads VALUES ('upload','room','pending','pending.txt','text/plain','',1,1,1,1,0,'','token','expires','now');
+	INSERT INTO files VALUES ('existing','room','old.txt','text/plain','',1,0,'','','',0,1,1,'now');
+	PRAGMA user_version=3`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	upload, err := s.GetUpload(context.Background(), "room", "upload")
+	if err != nil || upload.EntryID != "pending" || upload.EntryIndex != 0 {
+		t.Fatalf("migrated upload: %#v err=%v", upload, err)
+	}
+	files, err := s.ListFiles(context.Background(), "room")
+	if err != nil || len(files) != 1 || files[0].EntryID != "existing" || files[0].EntryIndex != 0 {
+		t.Fatalf("migrated files: %#v err=%v", files, err)
+	}
+}
+
 func TestLegacyDatabaseRequiresCleanStart(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "legacy.db")
 	db, err := sql.Open("sqlite", path)

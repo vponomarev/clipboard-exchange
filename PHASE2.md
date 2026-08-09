@@ -32,7 +32,9 @@ real-time, отсутствие аккаунтов и client-side encryption. Ф
   MIME type, точный исходный размер и содержимое шифруются в браузере; последний
   чанк дополняется до полного размера. Сервер видит room ID, file ID, округлённый
   ciphertext size, число чанков и время операций.
-- Preview/thumbnail generation на сервере в первый релиз не входит.
+- Безопасные поддерживаемые браузером типы можно открыть inline. Сервер не
+  генерирует preview/thumbnail; HTML, SVG и неизвестные типы доступны только для
+  скачивания.
 
 Эти значения будут настраиваться флагами и environment variables.
 
@@ -85,8 +87,10 @@ capability без аккаунтов и администратора комна�
 Миграция ранней схемы v0.2 не выполняется. Перед первым запуском версии с
 capability-моделью оператор архивирует прежнюю SQLite и запускает сервер с пустой
 БД. Схема v0.3 автоматически дополняется режимом доступа; существующие комнаты
-мигрируют как защищённые и не теряют ограничение записи. Старый формат encrypted
-item v1 остаётся поддержан в клиентском протоколе.
+мигрируют как защищённые и не теряют ограничение записи. При обновлении базы
+v0.4 до protocol/schema v4 существующие файлы получают собственный `entryId` и
+остаются отдельными записями. Старый формат encrypted item v1 остаётся поддержан
+в клиентском протоколе.
 
 ## Добровольный alias
 
@@ -115,13 +119,14 @@ item v1 остаётся поддержан в клиентском проток
 
 Добавляются версионированные migrations и таблицы:
 
-- `uploads`: upload ID, room ID, ожидаемый stored size, reservation, chunk count,
-  полученные чанки, срок действия и encryption metadata;
-- `files`: file ID, room ID, storage object, размеры, chunk layout, manifest,
-  key ID, protocol version и timestamps;
+- `uploads`: upload ID, room ID, общий `entryId`, порядок `entryIndex`, ожидаемый
+  stored size, reservation, chunk count, полученные чанки, срок действия и
+  encryption metadata;
+- `files`: file ID, room ID, общий `entryId`, порядок `entryIndex`, storage
+  object, размеры, chunk layout, manifest, key ID, protocol version и timestamps;
 - `rooms`: режим доступа, опциональный write capability hash и schema version;
 - текстовые items: alias для open payload либо alias внутри encrypted v2 payload;
-- связь завершённого файла с общей timeline комнаты.
+- связь текста и нескольких завершённых файлов с одной записью общей timeline.
 
 Reservation создаётся транзакционно. Одновременные загрузки не смогут суммарно
 превысить room quota. Запись файла появляется в комнате только после успешного
@@ -153,15 +158,19 @@ POST   /api/rooms/{room}/uploads/{upload}/complete
 DELETE /api/rooms/{room}/uploads/{upload}
 GET    /api/rooms/{room}/files/{file}
 DELETE /api/rooms/{room}/files/{file}
+DELETE /api/rooms/{room}/entries/{entry}
 ```
 
 `POST uploads` возвращает upload ID, negotiated chunk size, expiry и уже принятые
 чанки. Это позволяет продолжать загрузку после обрыва. После перезагрузки страницы
 пользователь повторно выбирает тот же файл; клиент сверяет метаданные и digest.
 
-Download поддерживает стандартные `Content-Length`, `Content-Disposition`, ETag и
-Range для открытых файлов. Encrypted download выдаёт ciphertext stream и chunk
-layout, необходимый клиенту для последовательной расшифровки.
+`POST uploads` принимает общий `entryId` и `entryIndex`, поэтому необязательный
+текст и несколько файлов отображаются и удаляются как одно сообщение. Download
+поддерживает стандартные `Content-Length`, `Content-Disposition`, ETag и Range
+для открытых файлов. Параметр `?inline=1` разрешает просмотр только безопасных
+MIME types, поддержанных браузером. Encrypted download выдаёт ciphertext stream
+и chunk layout, необходимый клиенту для последовательной расшифровки.
 
 Ошибки API получают стабильные machine-readable codes: quota exceeded, upload
 expired, chunk conflict, invalid chunk, incomplete upload, file missing и storage
@@ -197,13 +206,15 @@ service worker: он формирует download response и принимает 
 - локальная настройка alias и отображение alias рядом с датой;
 - режим R/O без composer/delete/upload controls;
 - share dialog с отдельными R/O и R/W ссылками и QR-кодами;
-- выбор нескольких файлов;
+- выбор нескольких файлов в локальную очередь без немедленной отправки;
+- одно нажатие «Добавить» отправляет необязательный текст и все выбранные файлы
+  как одно сообщение;
 - очередь с прогрессом каждого файла и общим использованием quota;
 - cancel и retry/resume;
 - понятные состояния encrypting, uploading, finalizing и failed;
 - download progress и проверка целостности;
-- кнопки скачать, копировать имя и удалить;
-- точные имя и размер без серверных preview/formatting;
+- кнопки открыть (для безопасных типов), скачать, копировать имя и удалить;
+- точные имя и размер без серверного форматирования или генерации thumbnail;
 - адаптивная компоновка Android portrait/landscape;
 - уведомление о необходимости HTTPS для encrypted files;
 - доступные labels, keyboard navigation и светлая/тёмная темы.

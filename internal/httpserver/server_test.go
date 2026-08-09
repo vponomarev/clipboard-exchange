@@ -253,7 +253,7 @@ func TestCapabilitiesAndAliasLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
-	if capabilities["protocolVersion"] != float64(3) || capabilities["writeCapabilities"] != true || capabilities["openWriteRooms"] != true || capabilities["aliases"] != true {
+	if capabilities["protocolVersion"] != float64(4) || capabilities["writeCapabilities"] != true || capabilities["openWriteRooms"] != true || capabilities["groupedAttachments"] != true || capabilities["inlineFiles"] != true || capabilities["aliases"] != true {
 		t.Fatalf("unexpected capabilities: %#v", capabilities)
 	}
 
@@ -266,12 +266,26 @@ func TestCapabilitiesAndAliasLimit(t *testing.T) {
 	resp.Body.Close()
 }
 
+func TestInlineMIMETypeRejectsActiveContent(t *testing.T) {
+	for _, value := range []string{"text/plain; charset=utf-8", "application/pdf", "image/png", "audio/ogg", "video/mp4"} {
+		if !inlineMIMEType(value) {
+			t.Errorf("safe preview type rejected: %s", value)
+		}
+	}
+	for _, value := range []string{"text/html", "image/svg+xml", "application/javascript", "application/octet-stream"} {
+		if inlineMIMEType(value) {
+			t.Errorf("active or unsupported preview type accepted: %s", value)
+		}
+	}
+}
+
 func TestOpenFileUploadResumeRangeAndDelete(t *testing.T) {
 	ts := testServer(t)
 	client := ts.Client()
+	entryID := "123e4567-e89b-12d3-a456-426614174099"
 	resp := requestJSON(t, client, "POST", ts.URL+"/api/rooms", map[string]any{"id": "files", "encrypted": false, "keyId": "", "writeToken": testWriteToken})
 	resp.Body.Close()
-	resp = requestJSONWithToken(t, client, "POST", ts.URL+"/api/rooms/files/uploads", map[string]any{"name": "exact name.txt", "mimeType": "text/plain", "alias": "Вася", "size": 5}, testWriteToken)
+	resp = requestJSONWithToken(t, client, "POST", ts.URL+"/api/rooms/files/uploads", map[string]any{"entryId": entryID, "entryIndex": 7, "name": "exact name.txt", "mimeType": "text/plain", "alias": "Вася", "size": 5}, testWriteToken)
 	if resp.StatusCode != http.StatusCreated {
 		body, _ := io.ReadAll(resp.Body)
 		t.Fatalf("create upload: %s %s", resp.Status, body)
@@ -279,12 +293,17 @@ func TestOpenFileUploadResumeRangeAndDelete(t *testing.T) {
 	var created struct {
 		ID          string `json:"id"`
 		FileID      string `json:"fileId"`
+		EntryID     string `json:"entryId"`
+		EntryIndex  int    `json:"entryIndex"`
 		UploadToken string `json:"uploadToken"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&created); err != nil {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
+	if created.EntryID != entryID || created.EntryIndex != 7 {
+		t.Fatalf("entry metadata changed: %#v", created)
+	}
 	chunkURL := ts.URL + "/api/rooms/files/uploads/" + created.ID + "/chunks/0"
 	resp = requestUpload(t, client, "PUT", chunkURL, strings.NewReader("hello"), created.UploadToken)
 	if resp.StatusCode != http.StatusOK {
@@ -307,6 +326,11 @@ func TestOpenFileUploadResumeRangeAndDelete(t *testing.T) {
 		t.Fatalf("complete: %s %s", resp.Status, body)
 	}
 	resp.Body.Close()
+	resp = requestJSONWithToken(t, client, http.MethodPost, ts.URL+"/api/rooms/files/items", map[string]any{"id": entryID, "kind": "text", "content": "message with attachment", "alias": "Вася"}, testWriteToken)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create grouped text: %s", resp.Status)
+	}
+	resp.Body.Close()
 
 	req, _ := http.NewRequest("GET", ts.URL+"/api/rooms/files/files/"+created.FileID, nil)
 	req.Header.Set("Range", "bytes=1-3")
@@ -319,6 +343,14 @@ func TestOpenFileUploadResumeRangeAndDelete(t *testing.T) {
 	if resp.StatusCode != http.StatusPartialContent || string(body) != "ell" || !strings.Contains(resp.Header.Get("Content-Disposition"), "exact name.txt") {
 		t.Fatalf("range download: status=%s body=%q disposition=%q", resp.Status, body, resp.Header.Get("Content-Disposition"))
 	}
+	resp, err = client.Get(ts.URL + "/api/rooms/files/files/" + created.FileID + "?inline=1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK || !strings.HasPrefix(resp.Header.Get("Content-Disposition"), "inline") {
+		t.Fatalf("inline view: status=%s disposition=%q", resp.Status, resp.Header.Get("Content-Disposition"))
+	}
+	resp.Body.Close()
 
 	resp = requestJSON(t, client, "GET", ts.URL+"/api/rooms/files", nil)
 	var room roomResponse
@@ -326,19 +358,27 @@ func TestOpenFileUploadResumeRangeAndDelete(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
-	if len(room.Files) != 1 || room.Files[0].Name != "exact name.txt" || room.Files[0].Alias != "Вася" || room.Files[0].Size != 5 {
+	if len(room.Files) != 1 || room.Files[0].EntryID != entryID || room.Files[0].EntryIndex != 7 || room.Files[0].Name != "exact name.txt" || room.Files[0].Alias != "Вася" || room.Files[0].Size != 5 {
 		t.Fatalf("file metadata changed: %#v", room.Files)
 	}
-	resp = requestJSON(t, client, "DELETE", ts.URL+"/api/rooms/files/files/"+created.FileID, nil)
+	resp = requestJSON(t, client, "DELETE", ts.URL+"/api/rooms/files/entries/"+entryID, nil)
 	if resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("read-only delete: %s", resp.Status)
 	}
 	resp.Body.Close()
-	resp = requestJSONWithToken(t, client, "DELETE", ts.URL+"/api/rooms/files/files/"+created.FileID, nil, testWriteToken)
+	resp = requestJSONWithToken(t, client, "DELETE", ts.URL+"/api/rooms/files/entries/"+entryID, nil, testWriteToken)
 	if resp.StatusCode != http.StatusNoContent {
-		t.Fatalf("delete file: %s", resp.Status)
+		t.Fatalf("delete entry: %s", resp.Status)
 	}
 	resp.Body.Close()
+	resp = requestJSON(t, client, http.MethodGet, ts.URL+"/api/rooms/files", nil)
+	if err := json.NewDecoder(resp.Body).Decode(&room); err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if len(room.Items) != 0 || len(room.Files) != 0 {
+		t.Fatalf("entry was only partially deleted: %#v", room)
+	}
 }
 
 func TestEncryptedFileMetadataAndBytesRemainOpaque(t *testing.T) {
@@ -460,14 +500,14 @@ func TestServesEmbeddedApplication(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Contains(body, []byte(`/assets/app.js?v=7`)) {
+	if !bytes.Contains(body, []byte(`/assets/app.js?v=8`)) {
 		t.Fatal("page does not cache-bust app.js")
 	}
-	if !bytes.Contains(body, []byte(`/assets/style.css?v=7`)) {
+	if !bytes.Contains(body, []byte(`/assets/style.css?v=8`)) {
 		t.Fatal("page does not cache-bust style.css")
 	}
 
-	resp, err = ts.Client().Get(ts.URL + "/assets/app.js?v=7")
+	resp, err = ts.Client().Get(ts.URL + "/assets/app.js?v=8")
 	if err != nil {
 		t.Fatal(err)
 	}

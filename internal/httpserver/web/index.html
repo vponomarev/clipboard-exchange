@@ -6,9 +6,9 @@
   <meta name="color-scheme" content="light dark">
   <meta name="theme-color" content="#111827">
   <title>Clipboard Exchange</title>
-  <link rel="stylesheet" href="/assets/style.css?v=7">
+  <link rel="stylesheet" href="/assets/style.css?v=8">
   <script defer src="/assets/qrcode.min.js"></script>
-  <script defer src="/assets/app.js?v=7"></script>
+  <script defer src="/assets/app.js?v=8"></script>
 </head>
 <body>
   <header class="topbar">
@@ -79,7 +79,7 @@
           <input id="alias" autocomplete="nickname" placeholder="Необязательно; alias никем не проверяется">
         </div>
         <label class="sr-only" for="item-text">Текст для обмена</label>
-        <textarea id="item-text" maxlength="65536" placeholder="Вставьте текст, команду или несколько строк…" rows="5" required></textarea>
+        <textarea id="item-text" maxlength="65536" placeholder="Текст необязателен, если выбраны файлы…" rows="5"></textarea>
         <div id="file-drop" class="file-drop">
           <input id="file-input" type="file" multiple>
           <label for="file-input" class="button secondary">Добавить файлы</label>

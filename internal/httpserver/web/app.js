@@ -4,7 +4,7 @@
   const $ = (id) => document.getElementById(id);
   const roomMatch = location.pathname.match(/^\/r\/([A-Za-z0-9][A-Za-z0-9_-]{0,63})$/);
   const fragment = new URLSearchParams(location.hash.slice(1));
-  const state = { roomID: roomMatch ? roomMatch[1] : "", room: null, key: null, keyText: "", writeToken: fragment.get("write") || "", canWrite: Boolean(fragment.get("write")), items: [], files: [], capabilities: null, downloadRegistration: null, socket: null, refreshTimer: 0 };
+  const state = { roomID: roomMatch ? roomMatch[1] : "", room: null, key: null, keyText: "", writeToken: fragment.get("write") || "", canWrite: Boolean(fragment.get("write")), items: [], files: [], pendingFiles: [], capabilities: null, downloadRegistration: null, socket: null, refreshTimer: 0 };
   const encoder = new TextEncoder();
   const decoder = new TextDecoder("utf-8", { fatal: true });
 
@@ -260,49 +260,95 @@
   async function addItem(event) {
     event.preventDefault(); message("room-error", "");
     const text = $("item-text").value;
-    if (!text) return;
+    const pending = state.pendingFiles.filter((entry) => !entry.started);
+    if (!text && pending.length === 0) return;
     const alias = $("alias").value;
     if (Array.from(alias).length > 64) { message("room-error", "Alias не может быть длиннее 64 символов"); return; }
     $("send").disabled = true;
     try {
-      const payload = state.room.encrypted ? await encrypt(text, alias) : { kind: "text", content: text, alias };
-      payload.id = uuid();
-      await api(`/api/rooms/${encodeURIComponent(state.roomID)}/items`, { method: "POST", body: JSON.stringify(payload), write: true });
-      $("item-text").value = ""; await refresh();
+      const resumed = pending.map((entry) => loadUploadSession(entry.file)?.entryId).find(Boolean);
+      const entryID = resumed || uuid();
+      if (text) {
+        const payload = state.room.encrypted ? await encrypt(text, alias) : { kind: "text", content: text, alias };
+        payload.id = entryID;
+        await api(`/api/rooms/${encodeURIComponent(state.roomID)}/items`, { method: "POST", body: JSON.stringify(payload), write: true });
+        $("item-text").value = "";
+      }
+      state.pendingFiles = state.pendingFiles.filter((entry) => !pending.includes(entry));
+      for (const [entryIndex, entry] of pending.entries()) {
+        entry.started = true;
+        entry.control.entryID = entryID;
+        entry.status.textContent = "Подготовка…";
+        runUpload(entry.file, entry.row, entry.progress, entry.status, entry.actions, entry.control, entryID, entryIndex).catch(() => {});
+      }
+      await refresh();
     } catch (error) { message("room-error", error.message); }
     finally { $("send").disabled = false; }
   }
 
   async function renderItems() {
     const container = $("items"); container.replaceChildren(); let failures = 0;
+    const entries = new Map();
     for (const item of state.items) {
       let text = item.content, alias = item.alias || "";
       if (item.kind === "encrypted") {
         try { const decrypted = await decrypt(item); text = decrypted.text; alias = decrypted.alias; } catch (_) { text = "[Не удалось расшифровать запись]"; alias = ""; failures++; }
       }
-      const article = document.createElement("article"); article.className = "item"; article.dataset.id = item.id;
-      const pre = document.createElement("pre"); pre.className = "item-content"; pre.textContent = text;
+      entries.set(item.id, { id:item.id, text, alias, createdAt:item.createdAt, files:[] });
+    }
+    for (const file of state.files) {
+      let metadata = file;
+      if (file.encrypted) {
+        try { metadata = { ...file, ...(await decryptFileManifest(file)) }; }
+        catch (_) { metadata = { ...file, name:"[Не удалось расшифровать имя файла]", mimeType:"application/octet-stream", alias:"", size:0 }; failures++; }
+      }
+      const entryID = file.entryId || file.id;
+      let entry = entries.get(entryID);
+      if (!entry) {
+        entry = { id:entryID, text:"", alias:metadata.alias || "", createdAt:file.createdAt, files:[] };
+        entries.set(entryID, entry);
+      }
+      entry.files.push({ file, metadata });
+      if (!entry.alias && metadata.alias) entry.alias = metadata.alias;
+      if (new Date(file.createdAt) < new Date(entry.createdAt)) entry.createdAt = file.createdAt;
+    }
+    for (const entry of entries.values()) entry.files.sort((left, right) => (left.file.entryIndex || 0) - (right.file.entryIndex || 0));
+    const ordered = Array.from(entries.values()).sort((left, right) => new Date(right.createdAt) - new Date(left.createdAt));
+    for (const entry of ordered) {
+      const article = document.createElement("article"); article.className = `item${entry.text ? "" : " file-item"}`; article.dataset.id = entry.id;
+      if (entry.text) {
+        const pre = document.createElement("pre"); pre.className = "item-content"; pre.textContent = entry.text;
+        article.append(pre);
+      }
+      if (entry.files.length) {
+        const attachments = document.createElement("div"); attachments.className = "attachments";
+        for (const attached of entry.files) attachments.append(renderFileAttachment(attached.file, attached.metadata));
+        article.append(attachments);
+      }
       const footer = document.createElement("div"); footer.className = "item-footer";
-      const time = document.createElement("time"); time.className = "item-time"; time.dateTime = item.createdAt;
-      time.textContent = new Intl.DateTimeFormat(undefined, { dateStyle:"medium", timeStyle:"short" }).format(new Date(item.createdAt));
+      const time = document.createElement("time"); time.className = "item-time"; time.dateTime = entry.createdAt;
+      time.textContent = new Intl.DateTimeFormat(undefined, { dateStyle:"medium", timeStyle:"short" }).format(new Date(entry.createdAt));
       const meta = document.createElement("div"); meta.className = "item-meta";
-      if (alias) { const author = document.createElement("span"); author.className = "item-alias"; author.textContent = alias; meta.append(author); }
+      if (entry.alias) { const author = document.createElement("span"); author.className = "item-alias"; author.textContent = entry.alias; meta.append(author); }
       meta.append(time);
       const buttons = document.createElement("div"); buttons.className = "item-buttons";
       const toggle = document.createElement("button"); toggle.type = "button"; toggle.className = "button secondary hidden"; toggle.dataset.action = "toggle"; toggle.textContent = "Развернуть"; toggle.setAttribute("aria-expanded", "false");
       const copy = document.createElement("button"); copy.type = "button"; copy.className = "button secondary"; copy.dataset.action = "copy"; copy.textContent = "Копировать";
-      const del = document.createElement("button"); del.type = "button"; del.className = "button secondary delete"; del.dataset.action = "delete"; del.textContent = "Удалить";
-      buttons.append(toggle, copy); if (state.canWrite) buttons.append(del); footer.append(meta, buttons); article.append(pre, footer); container.append(article);
-      updateItemOverflow(article);
+      const del = document.createElement("button"); del.type = "button"; del.className = "button secondary delete"; del.dataset.action = "entry-delete"; del.textContent = "Удалить";
+      if (entry.text) buttons.append(toggle, copy);
+      if (state.canWrite) buttons.append(del);
+      footer.append(meta, buttons); article.append(footer); container.append(article);
+      if (entry.text) updateItemOverflow(article);
     }
-    for (const file of state.files) await renderFile(container, file);
-    show("empty", state.items.length === 0 && state.files.length === 0);
-    if (failures) message("room-error", `${failures} записей не удалось расшифровать`);
+    $("item-count").textContent = `${ordered.length} сообщений · ${state.files.length} файлов`;
+    show("empty", ordered.length === 0);
+    if (failures) message("room-error", `${failures} элементов не удалось расшифровать`);
   }
 
   async function itemAction(event) {
     const button = event.target.closest("button[data-action]"); if (!button) return;
     const article = button.closest(".item");
+    const attachment = button.closest(".file-attachment");
     if (button.dataset.action === "toggle") {
       const pre = article.querySelector("pre");
       const expanded = pre.classList.contains("collapsed");
@@ -312,45 +358,42 @@
       return;
     }
     if (button.dataset.action === "copy") { await copyText(article.querySelector("pre").textContent); toast("Текст скопирован"); return; }
-    if (button.dataset.action === "file-copy") { await copyText(article.dataset.name); toast("Имя файла скопировано"); return; }
-    if (button.dataset.action === "encrypted-download") { await startEncryptedDownload(article); return; }
+    if (button.dataset.action === "file-copy") { await copyText(attachment.dataset.name); toast("Имя файла скопировано"); return; }
+    if (button.dataset.action === "encrypted-download") { await startEncryptedDownload(attachment, false); return; }
+    if (button.dataset.action === "encrypted-open") { await startEncryptedDownload(attachment, true); return; }
     if (button.dataset.action === "file-delete") {
       button.disabled = true;
-      try { await api(`/api/rooms/${encodeURIComponent(state.roomID)}/files/${article.dataset.id}`, { method:"DELETE", write:true }); await refresh(); }
+      try { await api(`/api/rooms/${encodeURIComponent(state.roomID)}/files/${attachment.dataset.id}`, { method:"DELETE", write:true }); await refresh(); }
       catch (error) { message("room-error", error.message); button.disabled = false; }
       return;
     }
-    if (button.dataset.action === "delete") {
+    if (button.dataset.action === "entry-delete") {
       button.disabled = true;
-      try { await api(`/api/rooms/${encodeURIComponent(state.roomID)}/items/${article.dataset.id}`, { method:"DELETE", write:true }); await refresh(); }
+      try { await api(`/api/rooms/${encodeURIComponent(state.roomID)}/entries/${article.dataset.id}`, { method:"DELETE", write:true }); await refresh(); }
       catch (error) { message("room-error", error.message); button.disabled = false; }
     }
   }
 
-  async function renderFile(container, file) {
-    let metadata = file;
-    if (file.encrypted) {
-      try { metadata = { ...file, ...(await decryptFileManifest(file)) }; }
-      catch (_) { metadata = { ...file, name:"[Не удалось расшифровать имя файла]", mimeType:"application/octet-stream", alias:"", plaintextSize:0 }; }
-    }
-    const article = document.createElement("article"); article.className = "item file-item"; article.dataset.id = file.id; article.dataset.name = file.name;
+  function renderFileAttachment(file, metadata) {
+    const attachment = document.createElement("div"); attachment.className = "file-attachment"; attachment.dataset.id = file.id; attachment.dataset.name = metadata.name;
+    if (file.encrypted) attachment.dataset.metadata = JSON.stringify(metadata);
     const details = document.createElement("div"); details.className = "file-details";
-    article.dataset.name = metadata.name;
     const name = document.createElement("strong"); name.className = "file-name"; name.textContent = metadata.name;
     const meta = document.createElement("div"); meta.className = "item-meta";
-    if (metadata.alias) { const alias = document.createElement("span"); alias.className = "item-alias"; alias.textContent = metadata.alias; meta.append(alias); }
     const size = document.createElement("span"); size.className = "muted"; size.textContent = formatBytes(file.encrypted ? metadata.size : file.size); meta.append(size);
-    const time = document.createElement("time"); time.className = "item-time"; time.dateTime = file.createdAt;
-    time.textContent = new Intl.DateTimeFormat(undefined, { dateStyle:"medium", timeStyle:"short" }).format(new Date(file.createdAt)); meta.append(time);
     details.append(name, meta);
     const buttons = document.createElement("div"); buttons.className = "item-buttons";
+    const open = document.createElement(file.encrypted ? "button" : "a"); open.className = "button secondary"; open.textContent = "Открыть";
+    if (file.encrypted) { open.type = "button"; open.dataset.action = "encrypted-open"; }
+    else { open.target = "_blank"; open.rel = "noopener"; open.href = `/api/rooms/${encodeURIComponent(state.roomID)}/files/${file.id}?inline=1`; }
     const download = document.createElement(file.encrypted ? "button" : "a"); download.className = "button primary"; download.textContent = "Скачать";
-    if (file.encrypted) { download.type = "button"; download.dataset.action = "encrypted-download"; article.dataset.metadata = JSON.stringify(metadata); }
+    if (file.encrypted) { download.type = "button"; download.dataset.action = "encrypted-download"; }
     else { download.download = file.name; download.href = `/api/rooms/${encodeURIComponent(state.roomID)}/files/${file.id}`; }
     const copy = document.createElement("button"); copy.type = "button"; copy.className = "button secondary"; copy.dataset.action = "file-copy"; copy.textContent = "Копировать имя";
+    if (canPreview(metadata.mimeType)) buttons.append(open);
     buttons.append(download, copy);
-    if (state.canWrite) { const del = document.createElement("button"); del.type = "button"; del.className = "button secondary delete"; del.dataset.action = "file-delete"; del.textContent = "Удалить"; buttons.append(del); }
-    article.append(details, buttons); container.append(article);
+    attachment.append(details, buttons);
+    return attachment;
   }
 
   function formatBytes(value) {
@@ -362,7 +405,7 @@
 
   async function ensureDownloadWorker() {
     if (!navigator.serviceWorker) throw new Error("Браузер не поддерживает потоковое скачивание зашифрованных файлов");
-    state.downloadRegistration = await navigator.serviceWorker.register("/assets/download-sw.js?v=4", { scope:"/" });
+    state.downloadRegistration = await navigator.serviceWorker.register("/assets/download-sw.js?v=5", { scope:"/" });
     await navigator.serviceWorker.ready;
     if (!navigator.serviceWorker.controller) {
       await new Promise((resolve, reject) => {
@@ -372,19 +415,30 @@
     }
   }
 
-  async function startEncryptedDownload(article) {
+  async function startEncryptedDownload(attachment, inline) {
+    const preview = inline ? window.open("about:blank", "_blank") : null;
+    if (preview) preview.opener = null;
     try {
+      if (inline && !preview) throw new Error("Браузер заблокировал окно просмотра");
       if (!state.key || !state.keyText.startsWith("ce1_")) throw new Error("Сначала откройте ключ комнаты");
       await ensureDownloadWorker();
-      const file = state.files.find((entry) => entry.id === article.dataset.id);
-      const metadata = JSON.parse(article.dataset.metadata);
+      const file = state.files.find((entry) => entry.id === attachment.dataset.id);
+      const metadata = JSON.parse(attachment.dataset.metadata);
       const token = uuid();
       const channel = new MessageChannel();
       const ready = new Promise((resolve, reject) => { const timer = setTimeout(() => reject(new Error("Service Worker не ответил")), 5000); channel.port1.onmessage = () => { clearTimeout(timer); resolve(); }; });
-      navigator.serviceWorker.controller.postMessage({ type:"prepare-download", token, config:{ rawKey:state.keyText.slice(4), roomID:state.roomID, fileID:file.id, chunkSize:file.chunkSize, chunkCount:file.chunkCount, size:metadata.size, name:metadata.name, mimeType:metadata.mimeType, url:`/api/rooms/${encodeURIComponent(state.roomID)}/files/${file.id}` } }, [channel.port2]);
+      navigator.serviceWorker.controller.postMessage({ type:"prepare-download", token, config:{ rawKey:state.keyText.slice(4), roomID:state.roomID, fileID:file.id, chunkSize:file.chunkSize, chunkCount:file.chunkCount, size:metadata.size, name:metadata.name, mimeType:metadata.mimeType, disposition:inline ? "inline" : "attachment", url:`/api/rooms/${encodeURIComponent(state.roomID)}/files/${file.id}` } }, [channel.port2]);
       await ready;
-      const frame = document.createElement("iframe"); frame.hidden = true; frame.src = `/client-download/${token}`; document.body.append(frame); setTimeout(() => frame.remove(), 60000);
-    } catch (error) { message("room-error", error.message); }
+      if (inline) preview.location = `/client-download/${token}`;
+      else { const frame = document.createElement("iframe"); frame.hidden = true; frame.src = `/client-download/${token}`; document.body.append(frame); setTimeout(() => frame.remove(), 60000); }
+    } catch (error) { preview?.close(); message("room-error", error.message); }
+  }
+
+  function canPreview(value) {
+    const mediaType = String(value || "").split(";", 1)[0].trim().toLowerCase();
+    if (mediaType.startsWith("audio/") || mediaType.startsWith("video/")) return true;
+    if (mediaType.startsWith("image/") && mediaType !== "image/svg+xml") return true;
+    return ["text/plain", "text/csv", "application/json", "application/pdf"].includes(mediaType);
   }
 
   function uploadStorageKey(file) { return `clipboard-exchange:upload:${state.roomID}:${file.name}:${file.size}`; }
@@ -429,23 +483,29 @@
     const row = document.createElement("div"); row.className = "upload-row";
     const name = document.createElement("span"); name.className = "upload-name"; name.textContent = file.name;
     const actions = document.createElement("div"); actions.className = "item-buttons";
-    const cancel = document.createElement("button"); cancel.type = "button"; cancel.className = "button secondary"; cancel.textContent = "Отмена";
+    const cancel = document.createElement("button"); cancel.type = "button"; cancel.className = "button secondary"; cancel.textContent = "Убрать";
     const progress = document.createElement("progress"); progress.max = Math.max(file.size, 1); progress.value = 0;
-    const status = document.createElement("span"); status.className = "muted"; status.textContent = "Подготовка…";
+    const status = document.createElement("span"); status.className = "muted"; status.textContent = "Готов к отправке";
     actions.append(cancel); row.append(name, actions, progress, status); $("upload-list").append(row);
-    const control = { controller: null, cancelled: false, session: null };
+    const control = { controller: null, cancelled: false, session: null, entryID: "", entryIndex: 0 };
+    const pending = { file, row, progress, status, actions, control, started: false };
+    state.pendingFiles.push(pending);
     cancel.addEventListener("click", async () => {
       control.cancelled = true; control.controller?.abort(); cancel.disabled = true;
       if (control.session) await uploadAPI(`/api/rooms/${encodeURIComponent(state.roomID)}/uploads/${control.session.id}`, { method:"DELETE" }, control.session.uploadToken).catch(() => {});
-      removeUploadSession(file); row.remove();
+      if (pending.started) removeUploadSession(file);
+      state.pendingFiles = state.pendingFiles.filter((entry) => entry !== pending);
+      row.remove();
     });
-    runUpload(file, row, progress, status, actions, control).catch(() => {});
   }
 
-  async function runUpload(file, row, progress, status, actions, control) {
+  async function runUpload(file, row, progress, status, actions, control, requestedEntryID, requestedEntryIndex = 0) {
     try {
       control.cancelled = false;
       let session = loadUploadSession(file);
+      if (session) {
+        if (!session.entryId) { removeUploadSession(file); session = null; }
+      }
       if (session) {
         try {
           const current = await uploadAPI(`/api/rooms/${encodeURIComponent(state.roomID)}/uploads/${session.id}`, { method:"GET" }, session.uploadToken);
@@ -456,6 +516,10 @@
           }
         } catch (_) { removeUploadSession(file); session = null; }
       }
+      const entryID = session?.entryId || requestedEntryID;
+      const entryIndex = session?.entryIndex ?? requestedEntryIndex;
+      control.entryID = entryID;
+      control.entryIndex = entryIndex;
       if (!session) {
         status.textContent = "Создание загрузки…";
         const encrypted = state.room.encrypted;
@@ -464,7 +528,7 @@
         const chunkCount = Math.max(1, Math.ceil(file.size / plainChunkSize));
         const storedSize = encrypted ? chunkCount * (plainChunkSize + 28) : file.size;
         const alias = $("alias").value;
-        session = await api(`/api/rooms/${encodeURIComponent(state.roomID)}/uploads`, { method:"POST", body:JSON.stringify({ name:encrypted ? "" : file.name, mimeType:encrypted ? "" : (file.type || "application/octet-stream"), alias:encrypted ? "" : alias, size:storedSize, encrypted, keyId:encrypted ? state.room.keyId : "" }), write:true });
+        session = await api(`/api/rooms/${encodeURIComponent(state.roomID)}/uploads`, { method:"POST", body:JSON.stringify({ entryId:entryID, entryIndex, name:encrypted ? "" : file.name, mimeType:encrypted ? "" : (file.type || "application/octet-stream"), alias:encrypted ? "" : alias, size:storedSize, encrypted, keyId:encrypted ? state.room.keyId : "" }), write:true });
         session.clientMeta = { name:file.name, mimeType:file.type || "application/octet-stream", size:file.size, alias, chunkSize:plainChunkSize, chunkCount };
         saveUploadSession(file, session);
       }
@@ -494,7 +558,7 @@
       status.textContent = `Ошибка: ${error.message}`;
       let retry = actions.querySelector('[data-action="upload-retry"]');
       if (!retry) { retry = document.createElement("button"); retry.type = "button"; retry.className = "button secondary"; retry.dataset.action = "upload-retry"; retry.textContent = "Повторить"; actions.prepend(retry); }
-      retry.onclick = () => { retry.remove(); runUpload(file, row, progress, status, actions, control).catch(() => {}); };
+      retry.onclick = () => { retry.remove(); runUpload(file, row, progress, status, actions, control, control.entryID, control.entryIndex).catch(() => {}); };
     }
   }
 

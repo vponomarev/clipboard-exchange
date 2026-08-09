@@ -45,6 +45,8 @@ type Item struct {
 type File struct {
 	ID                 string `json:"id"`
 	RoomID             string `json:"-"`
+	EntryID            string `json:"entryId"`
+	EntryIndex         int    `json:"entryIndex"`
 	Name               string `json:"name,omitempty"`
 	MIMEType           string `json:"mimeType,omitempty"`
 	Alias              string `json:"alias,omitempty"`
@@ -63,6 +65,8 @@ type Upload struct {
 	ID             string         `json:"id"`
 	RoomID         string         `json:"-"`
 	FileID         string         `json:"fileId"`
+	EntryID        string         `json:"entryId"`
+	EntryIndex     int            `json:"entryIndex"`
 	Name           string         `json:"name"`
 	MIMEType       string         `json:"mimeType"`
 	Alias          string         `json:"alias,omitempty"`
@@ -100,7 +104,7 @@ func Open(path string) (*Store, error) {
 			db.Close()
 			return nil, errors.New("legacy database schema is unsupported; archive it and start with an empty database")
 		}
-	} else if version != 2 && version != 3 {
+	} else if version != 2 && version != 3 && version != 4 {
 		db.Close()
 		return nil, fmt.Errorf("unsupported database schema version %d", version)
 	}
@@ -123,6 +127,55 @@ func Open(path string) (*Store, error) {
 		if err := tx.Commit(); err != nil {
 			db.Close()
 			return nil, fmt.Errorf("commit database schema migration: %w", err)
+		}
+		version = 3
+	}
+	if version == 3 {
+		tx, err := db.Begin()
+		if err != nil {
+			db.Close()
+			return nil, fmt.Errorf("start entry grouping migration: %w", err)
+		}
+		for _, table := range []string{"uploads", "files"} {
+			var exists int
+			if err := tx.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&exists); err != nil {
+				tx.Rollback()
+				db.Close()
+				return nil, fmt.Errorf("inspect entry grouping schema: %w", err)
+			}
+			if exists == 0 {
+				continue
+			}
+			idColumn := "file_id"
+			if table == "files" {
+				idColumn = "id"
+			}
+			if _, err := tx.Exec(fmt.Sprintf(`ALTER TABLE %s ADD COLUMN entry_id TEXT NOT NULL DEFAULT ''`, table)); err != nil {
+				tx.Rollback()
+				db.Close()
+				return nil, fmt.Errorf("migrate entry grouping schema: %w", err)
+			}
+			if _, err := tx.Exec(fmt.Sprintf(`ALTER TABLE %s ADD COLUMN entry_index INTEGER NOT NULL DEFAULT 0`, table)); err != nil {
+				tx.Rollback()
+				db.Close()
+				return nil, fmt.Errorf("migrate attachment ordering schema: %w", err)
+			}
+			if _, err := tx.Exec(fmt.Sprintf(`UPDATE %s SET entry_id=%s WHERE entry_id=''`, table, idColumn)); err != nil {
+				tx.Rollback()
+				db.Close()
+				return nil, fmt.Errorf("initialize entry grouping data: %w", err)
+			}
+		}
+		for _, stmt := range []string{`PRAGMA user_version=4`} {
+			if _, err := tx.Exec(stmt); err != nil {
+				tx.Rollback()
+				db.Close()
+				return nil, fmt.Errorf("migrate entry grouping schema: %w", err)
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("commit entry grouping migration: %w", err)
 		}
 	}
 	for _, stmt := range []string{
@@ -156,6 +209,8 @@ func Open(path string) (*Store, error) {
 			id TEXT PRIMARY KEY,
 			room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
 			file_id TEXT NOT NULL UNIQUE,
+			entry_id TEXT NOT NULL,
+			entry_index INTEGER NOT NULL DEFAULT 0,
 			name TEXT NOT NULL,
 			mime_type TEXT NOT NULL,
 			alias TEXT NOT NULL DEFAULT '',
@@ -181,6 +236,8 @@ func Open(path string) (*Store, error) {
 		`CREATE TABLE IF NOT EXISTS files (
 			id TEXT PRIMARY KEY,
 			room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+			entry_id TEXT NOT NULL,
+			entry_index INTEGER NOT NULL DEFAULT 0,
 			name TEXT NOT NULL,
 			mime_type TEXT NOT NULL,
 			alias TEXT NOT NULL DEFAULT '',
@@ -197,7 +254,8 @@ func Open(path string) (*Store, error) {
 		`CREATE INDEX IF NOT EXISTS uploads_room ON uploads(room_id)`,
 		`CREATE INDEX IF NOT EXISTS uploads_expiry ON uploads(expires_at)`,
 		`CREATE INDEX IF NOT EXISTS files_room_created ON files(room_id, created_at, id)`,
-		`PRAGMA user_version=3`,
+		`CREATE INDEX IF NOT EXISTS files_room_entry ON files(room_id, entry_id)`,
+		`PRAGMA user_version=4`,
 	} {
 		if _, err := db.Exec(stmt); err != nil {
 			db.Close()
@@ -269,7 +327,7 @@ func (s *Store) ListFiles(ctx context.Context, roomID string) ([]File, error) {
 	if _, err := s.GetRoom(ctx, roomID); err != nil {
 		return nil, err
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT id,room_id,name,mime_type,alias,size,encrypted,key_id,manifest_ciphertext,manifest_iv,version,chunk_size,chunk_count,created_at FROM files WHERE room_id=? ORDER BY created_at DESC, id DESC`, roomID)
+	rows, err := s.db.QueryContext(ctx, `SELECT id,room_id,entry_id,entry_index,name,mime_type,alias,size,encrypted,key_id,manifest_ciphertext,manifest_iv,version,chunk_size,chunk_count,created_at FROM files WHERE room_id=? ORDER BY created_at DESC, id DESC`, roomID)
 	if err != nil {
 		return nil, err
 	}
@@ -278,7 +336,7 @@ func (s *Store) ListFiles(ctx context.Context, roomID string) ([]File, error) {
 	for rows.Next() {
 		var file File
 		var encrypted int
-		if err := rows.Scan(&file.ID, &file.RoomID, &file.Name, &file.MIMEType, &file.Alias, &file.Size, &encrypted, &file.KeyID, &file.ManifestCiphertext, &file.ManifestIV, &file.Version, &file.ChunkSize, &file.ChunkCount, &file.CreatedAt); err != nil {
+		if err := rows.Scan(&file.ID, &file.RoomID, &file.EntryID, &file.EntryIndex, &file.Name, &file.MIMEType, &file.Alias, &file.Size, &encrypted, &file.KeyID, &file.ManifestCiphertext, &file.ManifestIV, &file.Version, &file.ChunkSize, &file.ChunkCount, &file.CreatedAt); err != nil {
 			return nil, err
 		}
 		file.Encrypted = encrypted != 0
@@ -389,6 +447,9 @@ func (s *Store) DeleteItem(ctx context.Context, roomID, itemID string) error {
 }
 
 func (s *Store) CreateUpload(ctx context.Context, upload Upload, maxRoomBytes int64, maxActive int) error {
+	if upload.EntryID == "" {
+		upload.EntryID = upload.FileID
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -423,7 +484,7 @@ func (s *Store) CreateUpload(ctx context.Context, upload Upload, maxRoomBytes in
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	upload.CreatedAt = now
-	_, err = tx.ExecContext(ctx, `INSERT INTO uploads(id,room_id,file_id,name,mime_type,alias,size,chunk_size,chunk_count,plain_chunk_size,encrypted,key_id,token_hash,expires_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, upload.ID, upload.RoomID, upload.FileID, upload.Name, upload.MIMEType, upload.Alias, upload.Size, upload.ChunkSize, upload.ChunkCount, upload.PlainChunkSize, upload.Encrypted, upload.KeyID, upload.TokenHash, upload.ExpiresAt, now)
+	_, err = tx.ExecContext(ctx, `INSERT INTO uploads(id,room_id,file_id,entry_id,entry_index,name,mime_type,alias,size,chunk_size,chunk_count,plain_chunk_size,encrypted,key_id,token_hash,expires_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, upload.ID, upload.RoomID, upload.FileID, upload.EntryID, upload.EntryIndex, upload.Name, upload.MIMEType, upload.Alias, upload.Size, upload.ChunkSize, upload.ChunkCount, upload.PlainChunkSize, upload.Encrypted, upload.KeyID, upload.TokenHash, upload.ExpiresAt, now)
 	if err != nil {
 		if isConstraint(err) {
 			return ErrConflict
@@ -436,7 +497,7 @@ func (s *Store) CreateUpload(ctx context.Context, upload Upload, maxRoomBytes in
 func (s *Store) GetUpload(ctx context.Context, roomID, uploadID string) (Upload, error) {
 	var upload Upload
 	var encrypted int
-	err := s.db.QueryRowContext(ctx, `SELECT id,room_id,file_id,name,mime_type,alias,size,chunk_size,chunk_count,plain_chunk_size,encrypted,key_id,token_hash,expires_at,created_at FROM uploads WHERE id=? AND room_id=?`, uploadID, roomID).Scan(&upload.ID, &upload.RoomID, &upload.FileID, &upload.Name, &upload.MIMEType, &upload.Alias, &upload.Size, &upload.ChunkSize, &upload.ChunkCount, &upload.PlainChunkSize, &encrypted, &upload.KeyID, &upload.TokenHash, &upload.ExpiresAt, &upload.CreatedAt)
+	err := s.db.QueryRowContext(ctx, `SELECT id,room_id,file_id,entry_id,entry_index,name,mime_type,alias,size,chunk_size,chunk_count,plain_chunk_size,encrypted,key_id,token_hash,expires_at,created_at FROM uploads WHERE id=? AND room_id=?`, uploadID, roomID).Scan(&upload.ID, &upload.RoomID, &upload.FileID, &upload.EntryID, &upload.EntryIndex, &upload.Name, &upload.MIMEType, &upload.Alias, &upload.Size, &upload.ChunkSize, &upload.ChunkCount, &upload.PlainChunkSize, &encrypted, &upload.KeyID, &upload.TokenHash, &upload.ExpiresAt, &upload.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Upload{}, ErrNotFound
 	}
@@ -509,7 +570,7 @@ func (s *Store) CompleteUpload(ctx context.Context, roomID, uploadID, manifestCi
 	var chunkCount, received int
 	var receivedSize int64
 	var encrypted int
-	err = tx.QueryRowContext(ctx, `SELECT file_id,room_id,name,mime_type,alias,size,chunk_count,encrypted,key_id,plain_chunk_size FROM uploads WHERE id=? AND room_id=?`, uploadID, roomID).Scan(&file.ID, &file.RoomID, &file.Name, &file.MIMEType, &file.Alias, &file.Size, &chunkCount, &encrypted, &file.KeyID, &file.ChunkSize)
+	err = tx.QueryRowContext(ctx, `SELECT file_id,room_id,entry_id,entry_index,name,mime_type,alias,size,chunk_count,encrypted,key_id,plain_chunk_size FROM uploads WHERE id=? AND room_id=?`, uploadID, roomID).Scan(&file.ID, &file.RoomID, &file.EntryID, &file.EntryIndex, &file.Name, &file.MIMEType, &file.Alias, &file.Size, &chunkCount, &encrypted, &file.KeyID, &file.ChunkSize)
 	if errors.Is(err, sql.ErrNoRows) {
 		return File{}, ErrNotFound
 	}
@@ -528,7 +589,7 @@ func (s *Store) CompleteUpload(ctx context.Context, roomID, uploadID, manifestCi
 	file.ManifestIV = manifestIV
 	file.Version = version
 	file.CreatedAt = time.Now().UTC().Format(time.RFC3339Nano)
-	if _, err := tx.ExecContext(ctx, `INSERT INTO files(id,room_id,name,mime_type,alias,size,encrypted,key_id,manifest_ciphertext,manifest_iv,version,chunk_size,chunk_count,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, file.ID, file.RoomID, file.Name, file.MIMEType, file.Alias, file.Size, file.Encrypted, file.KeyID, file.ManifestCiphertext, file.ManifestIV, file.Version, file.ChunkSize, file.ChunkCount, file.CreatedAt); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO files(id,room_id,entry_id,entry_index,name,mime_type,alias,size,encrypted,key_id,manifest_ciphertext,manifest_iv,version,chunk_size,chunk_count,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, file.ID, file.RoomID, file.EntryID, file.EntryIndex, file.Name, file.MIMEType, file.Alias, file.Size, file.Encrypted, file.KeyID, file.ManifestCiphertext, file.ManifestIV, file.Version, file.ChunkSize, file.ChunkCount, file.CreatedAt); err != nil {
 		if isConstraint(err) {
 			return File{}, ErrConflict
 		}
@@ -561,7 +622,7 @@ func (s *Store) AbortUpload(ctx context.Context, roomID, uploadID string) error 
 func (s *Store) GetFile(ctx context.Context, roomID, fileID string) (File, error) {
 	var file File
 	var encrypted int
-	err := s.db.QueryRowContext(ctx, `SELECT id,room_id,name,mime_type,alias,size,encrypted,key_id,manifest_ciphertext,manifest_iv,version,chunk_size,chunk_count,created_at FROM files WHERE id=? AND room_id=?`, fileID, roomID).Scan(&file.ID, &file.RoomID, &file.Name, &file.MIMEType, &file.Alias, &file.Size, &encrypted, &file.KeyID, &file.ManifestCiphertext, &file.ManifestIV, &file.Version, &file.ChunkSize, &file.ChunkCount, &file.CreatedAt)
+	err := s.db.QueryRowContext(ctx, `SELECT id,room_id,entry_id,entry_index,name,mime_type,alias,size,encrypted,key_id,manifest_ciphertext,manifest_iv,version,chunk_size,chunk_count,created_at FROM files WHERE id=? AND room_id=?`, fileID, roomID).Scan(&file.ID, &file.RoomID, &file.EntryID, &file.EntryIndex, &file.Name, &file.MIMEType, &file.Alias, &file.Size, &encrypted, &file.KeyID, &file.ManifestCiphertext, &file.ManifestIV, &file.Version, &file.ChunkSize, &file.ChunkCount, &file.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return File{}, ErrNotFound
 	}
@@ -587,6 +648,53 @@ func (s *Store) DeleteFile(ctx context.Context, roomID, fileID string) error {
 		return err
 	}
 	return tx.Commit()
+}
+
+// DeleteEntry removes a text item and every file attached to the same entry.
+// It returns object IDs so the caller can remove their filesystem payloads
+// after the metadata transaction has committed.
+func (s *Store) DeleteEntry(ctx context.Context, roomID, entryID string) ([]string, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	rows, err := tx.QueryContext(ctx, `SELECT id FROM files WHERE room_id=? AND entry_id=?`, roomID, entryID)
+	if err != nil {
+		return nil, err
+	}
+	var fileIDs []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		fileIDs = append(fileIDs, id)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	itemResult, err := tx.ExecContext(ctx, `DELETE FROM items WHERE room_id=? AND id=?`, roomID, entryID)
+	if err != nil {
+		return nil, err
+	}
+	fileResult, err := tx.ExecContext(ctx, `DELETE FROM files WHERE room_id=? AND entry_id=?`, roomID, entryID)
+	if err != nil {
+		return nil, err
+	}
+	itemsDeleted, _ := itemResult.RowsAffected()
+	filesDeleted, _ := fileResult.RowsAffected()
+	if itemsDeleted+filesDeleted == 0 {
+		return nil, ErrNotFound
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE rooms SET updated_at=? WHERE id=?`, time.Now().UTC().Format(time.RFC3339Nano), roomID); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return fileIDs, nil
 }
 
 func (s *Store) DeleteExpiredUploads(ctx context.Context, before time.Time) ([]string, error) {

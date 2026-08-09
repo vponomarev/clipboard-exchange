@@ -1,4 +1,4 @@
-# Clipboard Exchange protocol v3
+# Clipboard Exchange protocol v4
 
 `GET /api/capabilities` — источник negotiated limits и поддержанных версий.
 Клиент не должен считать настроечные значения сервера равными defaults.
@@ -68,6 +68,23 @@ Payload:
 первыми 12 байтами stored chunk. Nonce не может повторяться внутри upload.
 Manifest отправляется в `POST .../complete`; до успешного complete файл не
 появляется в комнате.
+
+Protocol v4 объединяет текст и несколько файлов в одну запись комнаты. Клиент
+создаёт общий UUID `entryId`, использует его как `item.id` для необязательного
+текста и передаёт в `POST uploads` для каждого файла. Поле `entryIndex`
+(`0..999`) задаёт порядок файлов внутри записи. Старый клиент может не передавать
+`entryId`: тогда сервер использует `fileId`, и файл становится отдельной записью.
+
+Удаление `DELETE /api/rooms/{room}/entries/{entryId}` атомарно удаляет текстовую
+часть и метаданные всех файлов этой записи, после чего сервер очищает их объекты.
+Старые endpoints удаления отдельного item/file сохраняются для совместимости.
+
+Открытый незашифрованный файл можно запросить с `?inline=1`. Сервер отвечает
+`Content-Disposition: inline` только для безопасных passive MIME types: plain
+text/CSV/JSON/PDF, raster images, audio и video. HTML, SVG, JavaScript и
+неизвестные типы всегда отдаются как attachment, чтобы файл комнаты не мог
+выполнять active content в origin приложения. Для encrypted file такое же
+решение принимает встроенный Service Worker после клиентской расшифровки.
 
 ## Deterministic AES-256-GCM test vector
 
