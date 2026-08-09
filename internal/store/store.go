@@ -21,12 +21,13 @@ var (
 type Store struct{ db *sql.DB }
 
 type Room struct {
-	ID        string `json:"id"`
-	Encrypted bool   `json:"encrypted"`
-	KeyID     string `json:"keyId,omitempty"`
-	WriteHash string `json:"-"`
-	CreatedAt string `json:"createdAt"`
-	UpdatedAt string `json:"updatedAt"`
+	ID             string `json:"id"`
+	Encrypted      bool   `json:"encrypted"`
+	KeyID          string `json:"keyId,omitempty"`
+	WriteProtected bool   `json:"writeProtected"`
+	WriteHash      string `json:"-"`
+	CreatedAt      string `json:"createdAt"`
+	UpdatedAt      string `json:"updatedAt"`
 }
 
 type Item struct {
@@ -99,9 +100,30 @@ func Open(path string) (*Store, error) {
 			db.Close()
 			return nil, errors.New("legacy database schema is unsupported; archive it and start with an empty database")
 		}
-	} else if version != 2 {
+	} else if version != 2 && version != 3 {
 		db.Close()
 		return nil, fmt.Errorf("unsupported database schema version %d", version)
+	}
+	if version == 2 {
+		tx, err := db.Begin()
+		if err != nil {
+			db.Close()
+			return nil, fmt.Errorf("start schema migration: %w", err)
+		}
+		if _, err := tx.Exec(`ALTER TABLE rooms ADD COLUMN write_protected INTEGER NOT NULL DEFAULT 1`); err != nil {
+			tx.Rollback()
+			db.Close()
+			return nil, fmt.Errorf("migrate database schema: %w", err)
+		}
+		if _, err := tx.Exec(`PRAGMA user_version=3`); err != nil {
+			tx.Rollback()
+			db.Close()
+			return nil, fmt.Errorf("record database schema migration: %w", err)
+		}
+		if err := tx.Commit(); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("commit database schema migration: %w", err)
+		}
 	}
 	for _, stmt := range []string{
 		`PRAGMA journal_mode=WAL`,
@@ -111,7 +133,8 @@ func Open(path string) (*Store, error) {
 			id TEXT PRIMARY KEY,
 			encrypted INTEGER NOT NULL,
 			key_id TEXT NOT NULL DEFAULT '',
-			write_hash TEXT NOT NULL,
+			write_protected INTEGER NOT NULL DEFAULT 1,
+			write_hash TEXT NOT NULL DEFAULT '',
 			created_at TEXT NOT NULL,
 			updated_at TEXT NOT NULL
 		)`,
@@ -174,7 +197,7 @@ func Open(path string) (*Store, error) {
 		`CREATE INDEX IF NOT EXISTS uploads_room ON uploads(room_id)`,
 		`CREATE INDEX IF NOT EXISTS uploads_expiry ON uploads(expires_at)`,
 		`CREATE INDEX IF NOT EXISTS files_room_created ON files(room_id, created_at, id)`,
-		`PRAGMA user_version=2`,
+		`PRAGMA user_version=3`,
 	} {
 		if _, err := db.Exec(stmt); err != nil {
 			db.Close()
@@ -200,7 +223,7 @@ func (s *Store) CreateRoom(ctx context.Context, room Room, maxRooms int) error {
 		return ErrLimit
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	_, err = tx.ExecContext(ctx, `INSERT INTO rooms(id, encrypted, key_id, write_hash, created_at, updated_at) VALUES(?,?,?,?,?,?)`, room.ID, room.Encrypted, room.KeyID, room.WriteHash, now, now)
+	_, err = tx.ExecContext(ctx, `INSERT INTO rooms(id, encrypted, key_id, write_protected, write_hash, created_at, updated_at) VALUES(?,?,?,?,?,?,?)`, room.ID, room.Encrypted, room.KeyID, room.WriteProtected, room.WriteHash, now, now)
 	if err != nil {
 		if isConstraint(err) {
 			return ErrConflict
@@ -212,12 +235,13 @@ func (s *Store) CreateRoom(ctx context.Context, room Room, maxRooms int) error {
 
 func (s *Store) GetRoom(ctx context.Context, id string) (Room, error) {
 	var room Room
-	var encrypted int
-	err := s.db.QueryRowContext(ctx, `SELECT id, encrypted, key_id, write_hash, created_at, updated_at FROM rooms WHERE id=?`, id).Scan(&room.ID, &encrypted, &room.KeyID, &room.WriteHash, &room.CreatedAt, &room.UpdatedAt)
+	var encrypted, writeProtected int
+	err := s.db.QueryRowContext(ctx, `SELECT id, encrypted, key_id, write_protected, write_hash, created_at, updated_at FROM rooms WHERE id=?`, id).Scan(&room.ID, &encrypted, &room.KeyID, &writeProtected, &room.WriteHash, &room.CreatedAt, &room.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Room{}, ErrNotFound
 	}
 	room.Encrypted = encrypted != 0
+	room.WriteProtected = writeProtected != 0
 	return room, err
 }
 
@@ -302,10 +326,14 @@ func (s *Store) AddItem(ctx context.Context, roomID string, item Item, maxItems 
 
 func (s *Store) AuthorizeWrite(ctx context.Context, roomID, candidateHash string) error {
 	var expected string
-	if err := s.db.QueryRowContext(ctx, `SELECT write_hash FROM rooms WHERE id=?`, roomID).Scan(&expected); errors.Is(err, sql.ErrNoRows) {
+	var writeProtected int
+	if err := s.db.QueryRowContext(ctx, `SELECT write_protected,write_hash FROM rooms WHERE id=?`, roomID).Scan(&writeProtected, &expected); errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
 	} else if err != nil {
 		return err
+	}
+	if writeProtected == 0 {
+		return nil
 	}
 	if len(expected) != len(candidateHash) || subtle.ConstantTimeCompare([]byte(expected), []byte(candidateHash)) != 1 {
 		return ErrForbidden
@@ -320,10 +348,14 @@ func (s *Store) RotateWriteHash(ctx context.Context, roomID, currentHash, nextHa
 	}
 	defer tx.Rollback()
 	var expected string
-	if err := tx.QueryRowContext(ctx, `SELECT write_hash FROM rooms WHERE id=?`, roomID).Scan(&expected); errors.Is(err, sql.ErrNoRows) {
+	var writeProtected int
+	if err := tx.QueryRowContext(ctx, `SELECT write_protected,write_hash FROM rooms WHERE id=?`, roomID).Scan(&writeProtected, &expected); errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
 	} else if err != nil {
 		return err
+	}
+	if writeProtected == 0 {
+		return ErrConflict
 	}
 	if len(expected) != len(currentHash) || subtle.ConstantTimeCompare([]byte(expected), []byte(currentHash)) != 1 {
 		return ErrForbidden

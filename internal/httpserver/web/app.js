@@ -57,7 +57,7 @@
   async function api(url, options = {}) {
     const { write = false, ...fetchOptions } = options;
     const headers = { ...(fetchOptions.body ? { "Content-Type": "application/json" } : {}), ...fetchOptions.headers };
-    if (write) {
+    if (write && state.room?.writeProtected) {
       if (!state.writeToken) throw new Error("Комната открыта только для чтения");
       headers.Authorization = `ClipboardWrite ${state.writeToken}`;
     }
@@ -114,6 +114,7 @@
     try {
       state.roomID = $("room-id").value;
       const encrypted = $("encrypted").checked;
+      const writeProtected = $("write-protected").checked;
       let keyId = ""; let keyText = "";
       if (encrypted) {
         if (!globalThis.crypto?.subtle) throw new Error("Шифрование требует HTTPS или localhost");
@@ -121,11 +122,13 @@
         const raw = entered ? await keyFromInput(entered) : crypto.getRandomValues(new Uint8Array(32));
         keyId = await keyID(raw); keyText = rawKeyText(raw);
       }
-      const writeToken = newWriteToken();
-      await api("/api/rooms", { method: "POST", body: JSON.stringify({ id: state.roomID, encrypted, keyId, writeToken }) });
-      const nextFragment = new URLSearchParams({ write: writeToken });
+      const writeToken = writeProtected ? newWriteToken() : "";
+      await api("/api/rooms", { method: "POST", body: JSON.stringify({ id: state.roomID, encrypted, keyId, writeProtected, writeToken }) });
+      const nextFragment = new URLSearchParams();
+      if (writeProtected) nextFragment.set("write", writeToken);
       if (encrypted) nextFragment.set("key", keyText);
-      location.href = `/r/${encodeURIComponent(state.roomID)}#${nextFragment}`;
+      const nextFragmentText = nextFragment.toString();
+      location.href = `/r/${encodeURIComponent(state.roomID)}${nextFragmentText ? `#${nextFragmentText}` : ""}`;
     } catch (error) { message("create-error", error.message); submit.disabled = false; }
   }
 
@@ -147,17 +150,14 @@
     for (const type of ["dragenter", "dragover"]) $("file-drop").addEventListener(type, (event) => { event.preventDefault(); $("file-drop").classList.add("dragging"); });
     for (const type of ["dragleave", "drop"]) $("file-drop").addEventListener(type, (event) => { event.preventDefault(); $("file-drop").classList.remove("dragging"); });
     $("file-drop").addEventListener("drop", (event) => queueFiles(event.dataTransfer.files));
-    show("item-form", state.canWrite);
-    show("access-notice", !state.canWrite);
     try {
       state.capabilities = await api("/api/capabilities");
       await refresh();
-      show("file-drop", state.canWrite);
       if (state.room.encrypted) {
         await prepareKey();
         ensureDownloadWorker().catch((error) => message("crypto-warning", `Потоковое скачивание пока недоступно: ${error.message}`));
       }
-      else { $("encryption-state").textContent = "Без шифрования"; $("file-input").disabled = !state.canWrite; renderItems(); }
+      else { $("encryption-state").textContent = "Без шифрования"; renderItems(); }
       connect();
     } catch (error) { message("room-error", error.message); $("item-text").disabled = true; $("send").disabled = true; }
   }
@@ -165,8 +165,18 @@
   async function refresh() {
     const data = await api(`/api/rooms/${encodeURIComponent(state.roomID)}`);
     state.room = data.room; state.items = data.items; state.files = data.files || [];
+    updateAccessState();
     $("item-count").textContent = `${state.items.length} записей · ${state.files.length} файлов`;
     if (!state.room.encrypted || state.key) await renderItems();
+  }
+
+  function updateAccessState() {
+    if (!state.room) return;
+    state.canWrite = !state.room.writeProtected || Boolean(state.writeToken);
+    show("item-form", state.canWrite);
+    show("access-notice", !state.canWrite);
+    show("file-drop", state.canWrite);
+    $("file-input").disabled = !state.canWrite || (state.room.encrypted && !state.key);
   }
 
   async function prepareKey() {
@@ -185,7 +195,7 @@
     const raw = await keyFromInput(value);
     if (await keyID(raw) !== state.room.keyId) throw new Error("Ключ не подходит к этой комнате");
     state.key = await importRawKey(raw); state.keyText = rawKeyText(raw);
-    $("file-input").disabled = !state.canWrite;
+    updateAccessState();
     $("encryption-state").textContent = "Сквозное шифрование включено";
     message("crypto-warning", "");
     await renderItems();
@@ -520,7 +530,8 @@
 
   function openShare() { updateShare(); $("share-dialog").showModal(); }
   function updateShare() {
-    const permission = document.querySelector('input[name="share-permission"]:checked')?.value || "read";
+    const writeProtected = Boolean(state.room?.writeProtected);
+    const permission = writeProtected ? (document.querySelector('input[name="share-permission"]:checked')?.value || "read") : "write";
     const withKey = !state.room?.encrypted || document.querySelector('input[name="share-key"]:checked')?.value === "key";
     const base = `${location.origin}/r/${encodeURIComponent(state.roomID)}`;
     const sharedFragment = new URLSearchParams();
@@ -529,10 +540,15 @@
     const sharedFragmentText = sharedFragment.toString();
     const url = sharedFragmentText ? `${base}#${sharedFragmentText}` : base;
     $("share-url").value = url;
-    show("share-write-option", Boolean(state.writeToken));
+    show("share-permission-choice", writeProtected);
+    show("share-write-option", writeProtected && Boolean(state.writeToken));
     show("share-key-choice", Boolean(state.room?.encrypted));
-    show("rotate-write", Boolean(state.writeToken));
-    $("share-note").textContent = permission === "write" && state.writeToken ? "R/W-ссылка позволяет добавлять и удалять записи." : "R/O-ссылка позволяет только читать и копировать записи.";
+    show("rotate-write", writeProtected && Boolean(state.writeToken));
+    $("share-note").textContent = !writeProtected
+      ? "Обычная R/W-комната: любой участник по этой ссылке может добавлять и удалять."
+      : permission === "write" && state.writeToken
+        ? "R/W-ссылка позволяет добавлять и удалять записи."
+        : "R/O-ссылка позволяет только читать и копировать записи.";
     const qr = $("qr"); qr.replaceChildren();
     if (globalThis.QRCode) new QRCode(qr, { text:url, width:220, height:220, correctLevel:QRCode.CorrectLevel.M });
     else qr.textContent = "QR-код недоступен";

@@ -6,9 +6,9 @@
   <meta name="color-scheme" content="light dark">
   <meta name="theme-color" content="#111827">
   <title>Clipboard Exchange</title>
-  <link rel="stylesheet" href="/assets/style.css?v=6">
+  <link rel="stylesheet" href="/assets/style.css?v=7">
   <script defer src="/assets/qrcode.min.js"></script>
-  <script defer src="/assets/app.js?v=6"></script>
+  <script defer src="/assets/app.js?v=7"></script>
 </head>
 <body>
   <header class="topbar">
@@ -28,10 +28,15 @@
       <form id="create-form" class="create-card">
         <label for="room-id">ID комнаты</label>
         <div class="input-action">
-          <input id="room-id" name="room" maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9_-]{0,63}" autocomplete="off" spellcheck="false" required>
+          <input id="room-id" name="room" maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9_\-]{0,63}" autocomplete="off" spellcheck="false" required>
           <button id="random-id" class="button secondary" type="button">Новый UUID</button>
         </div>
         <p class="hint">Короткие имена легко угадать. Используйте их только в доверенной сети.</p>
+
+        <label class="check-row">
+          <input id="write-protected" type="checkbox">
+          <span><strong>Разделить права R/O и R/W</strong><small>Для записи потребуется секретная R/W-ссылка. Без этой опции любой участник комнаты может добавлять и удалять.</small></span>
+        </label>
 
         <label class="check-row">
           <input id="encrypted" type="checkbox">
@@ -123,7 +128,7 @@
         <input id="share-url" readonly>
         <button id="copy-link" class="button secondary" type="button">Копировать</button>
       </div>
-      <div class="share-choice">
+      <div id="share-permission-choice" class="share-choice">
         <label><input type="radio" name="share-permission" value="read" checked> R/O</label>
         <label id="share-write-option"><input type="radio" name="share-permission" value="write"> R/W</label>
       </div>

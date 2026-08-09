@@ -109,13 +109,13 @@ func requestEncryptedChunk(t *testing.T, client *http.Client, url string, body [
 func TestRoomCRUDPreservesTextAndSecurityHeaders(t *testing.T) {
 	ts := testServer(t)
 	client := ts.Client()
-	resp := requestJSON(t, client, "POST", ts.URL+"/api/rooms", map[string]any{"id": "my-ex", "encrypted": false, "keyId": "", "writeToken": testWriteToken})
+	resp := requestJSON(t, client, "POST", ts.URL+"/api/rooms", map[string]any{"id": "my-ex", "encrypted": false, "keyId": "", "writeProtected": false, "writeToken": ""})
 	if resp.StatusCode != 201 {
 		t.Fatalf("create: %s", resp.Status)
 	}
 	resp.Body.Close()
 	text := "  echo $HOME\n\tline two\n"
-	resp = requestJSONWithToken(t, client, "POST", ts.URL+"/api/rooms/my-ex/items", map[string]any{"id": "123e4567-e89b-12d3-a456-426614174000", "kind": "text", "content": text, "alias": "Вася"}, testWriteToken)
+	resp = requestJSON(t, client, "POST", ts.URL+"/api/rooms/my-ex/items", map[string]any{"id": "123e4567-e89b-12d3-a456-426614174000", "kind": "text", "content": text, "alias": "Вася"})
 	if resp.StatusCode != 201 {
 		b, _ := io.ReadAll(resp.Body)
 		t.Fatalf("add: %s %s", resp.Status, b)
@@ -133,10 +133,10 @@ func TestRoomCRUDPreservesTextAndSecurityHeaders(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
-	if len(got.Items) != 1 || got.Items[0].Content != text || got.Items[0].Alias != "Вася" {
+	if got.Room.WriteProtected || len(got.Items) != 1 || got.Items[0].Content != text || got.Items[0].Alias != "Вася" {
 		t.Fatalf("content changed: %#v", got.Items)
 	}
-	resp = requestJSONWithToken(t, client, "DELETE", ts.URL+"/api/rooms/my-ex/items/123e4567-e89b-12d3-a456-426614174000", nil, testWriteToken)
+	resp = requestJSON(t, client, "DELETE", ts.URL+"/api/rooms/my-ex/items/123e4567-e89b-12d3-a456-426614174000", nil)
 	if resp.StatusCode != 204 {
 		t.Fatalf("delete: %s", resp.Status)
 	}
@@ -207,6 +207,40 @@ func TestWriteCapabilityReadOnlyWrongAndRotation(t *testing.T) {
 	resp.Body.Close()
 }
 
+func TestOpenWriteRoomRejectsCapabilityAndRotation(t *testing.T) {
+	ts := testServer(t)
+	client := ts.Client()
+	open := false
+	resp := requestJSON(t, client, http.MethodPost, ts.URL+"/api/rooms", map[string]any{
+		"id": "open-rights", "encrypted": false, "keyId": "", "writeProtected": open, "writeToken": testWriteToken,
+	})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("open room accepted a write capability: %s", resp.Status)
+	}
+	resp.Body.Close()
+
+	resp = requestJSON(t, client, http.MethodPost, ts.URL+"/api/rooms", map[string]any{
+		"id": "open-rights", "encrypted": false, "keyId": "", "writeProtected": open,
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create open room: %s", resp.Status)
+	}
+	resp.Body.Close()
+
+	resp = requestJSON(t, client, http.MethodPost, ts.URL+"/api/rooms/open-rights/write-capability/rotate", map[string]string{"writeToken": testWriteToken})
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("open room allowed capability rotation: %s", resp.Status)
+	}
+	var failure map[string]map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&failure); err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if failure["error"]["code"] != "write_capability_disabled" {
+		t.Fatalf("unexpected rotation error: %#v", failure)
+	}
+}
+
 func TestCapabilitiesAndAliasLimit(t *testing.T) {
 	ts := testServer(t)
 	client := ts.Client()
@@ -219,7 +253,7 @@ func TestCapabilitiesAndAliasLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
-	if capabilities["protocolVersion"] != float64(2) || capabilities["writeCapabilities"] != true || capabilities["aliases"] != true {
+	if capabilities["protocolVersion"] != float64(3) || capabilities["writeCapabilities"] != true || capabilities["openWriteRooms"] != true || capabilities["aliases"] != true {
 		t.Fatalf("unexpected capabilities: %#v", capabilities)
 	}
 
@@ -426,14 +460,14 @@ func TestServesEmbeddedApplication(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Contains(body, []byte(`/assets/app.js?v=6`)) {
+	if !bytes.Contains(body, []byte(`/assets/app.js?v=7`)) {
 		t.Fatal("page does not cache-bust app.js")
 	}
-	if !bytes.Contains(body, []byte(`/assets/style.css?v=6`)) {
+	if !bytes.Contains(body, []byte(`/assets/style.css?v=7`)) {
 		t.Fatal("page does not cache-bust style.css")
 	}
 
-	resp, err = ts.Client().Get(ts.URL + "/assets/app.js?v=6")
+	resp, err = ts.Client().Get(ts.URL + "/assets/app.js?v=7")
 	if err != nil {
 		t.Fatal(err)
 	}
