@@ -253,7 +253,7 @@ func TestCapabilitiesAndAliasLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
-	if capabilities["protocolVersion"] != float64(5) || capabilities["writeCapabilities"] != true || capabilities["openWriteRooms"] != true || capabilities["groupedAttachments"] != true || capabilities["inlineFiles"] != true || capabilities["aliases"] != true || capabilities["atomicEntries"] != true || capabilities["entryTTL"] != true || capabilities["roomTTL"] != true || capabilities["pwa"] != true {
+	if capabilities["protocolVersion"] != float64(5) || capabilities["writeCapabilities"] != true || capabilities["openWriteRooms"] != true || capabilities["groupedAttachments"] != true || capabilities["inlineFiles"] != true || capabilities["aliases"] != true || capabilities["atomicEntries"] != true || capabilities["entryTTL"] != true || capabilities["roomTTL"] != true || capabilities["pwa"] != true || capabilities["qrScanner"] != true {
 		t.Fatalf("unexpected capabilities: %#v", capabilities)
 	}
 
@@ -333,7 +333,7 @@ func TestAtomicTextEntryPinClearMetricsAndPWA(t *testing.T) {
 	if resp.StatusCode != http.StatusOK || !bytes.Contains(metrics, []byte("clipboard_exchange_rooms 1")) || bytes.Contains(metrics, []byte("exact")) {
 		t.Fatalf("unsafe or incomplete metrics: %s", metrics)
 	}
-	for _, asset := range []string{"/assets/manifest.webmanifest?v=1", "/assets/download-sw.js?v=7", "/assets/icon-192.png", "/assets/icon-512.png"} {
+	for _, asset := range []string{"/assets/manifest.webmanifest?v=2", "/assets/download-sw.js?v=9", "/assets/icon-192.png", "/assets/icon-512.png"} {
 		response, err := client.Get(ts.URL + asset)
 		if err != nil {
 			t.Fatal(err)
@@ -342,6 +342,9 @@ func TestAtomicTextEntryPinClearMetricsAndPWA(t *testing.T) {
 		response.Body.Close()
 		if response.StatusCode != http.StatusOK || len(body) < 8 {
 			t.Fatalf("PWA asset %s: status=%s bytes=%d", asset, response.Status, len(body))
+		}
+		if strings.Contains(asset, "manifest") && (!bytes.Contains(body, []byte(`"id": "/"`)) || !bytes.Contains(body, []byte(`"shortcuts"`)) || !bytes.Contains(body, []byte(`/?scan=1`))) {
+			t.Fatalf("incomplete install manifest: %s", body)
 		}
 		if strings.Contains(asset, ".png") && !bytes.Equal(body[:8], []byte("\x89PNG\r\n\x1a\n")) {
 			t.Fatalf("invalid PNG signature for %s", asset)
@@ -643,14 +646,14 @@ func TestServesEmbeddedApplication(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Contains(body, []byte(`/assets/app.js?v=13`)) {
+	if !bytes.Contains(body, []byte(`/assets/app.js?v=15`)) {
 		t.Fatal("page does not cache-bust app.js")
 	}
-	if !bytes.Contains(body, []byte(`/assets/style.css?v=10`)) {
+	if !bytes.Contains(body, []byte(`/assets/style.css?v=12`)) {
 		t.Fatal("page does not cache-bust style.css")
 	}
 
-	resp, err = ts.Client().Get(ts.URL + "/assets/app.js?v=13")
+	resp, err = ts.Client().Get(ts.URL + "/assets/app.js?v=15")
 	if err != nil {
 		t.Fatal(err)
 	}

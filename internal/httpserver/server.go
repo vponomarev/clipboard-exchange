@@ -172,6 +172,7 @@ func (s *Server) capabilities(w http.ResponseWriter, _ *http.Request) {
 		"entryTTL":               true,
 		"roomTTL":                true,
 		"pwa":                    true,
+		"qrScanner":              true,
 		"aliases":                true,
 		"encryptedTextVersions":  []int{1, 2},
 		"files":                  true,

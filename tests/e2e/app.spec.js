@@ -9,6 +9,13 @@ async function selectFiles(page, files, expected = Array.isArray(files) ? files.
   }).toBe(expected);
 }
 
+async function openComposerSettings(page) {
+  const details = page.locator(".composer-options");
+  await expect(details).toBeVisible();
+  if (await details.getAttribute("open") === null) await details.locator("summary").click();
+  await expect(details).toHaveAttribute("open", "");
+}
+
 test("HTTP-compatible UUID fallback initializes the page and honors room query", async ({ page }) => {
   await page.addInitScript(() => {
     Object.defineProperty(Crypto.prototype, "randomUUID", { value: undefined, configurable: true });
@@ -57,6 +64,7 @@ test("plain room preserves multiline text and updates another client", async ({ 
   const second = await secondContext.newPage();
   await second.goto(`/r/${room}`);
   const exact = "  printf '%s\\n' \"$PATH\"\n\tline two\n";
+  await openComposerSettings(page);
   await page.locator("#alias").fill("Вася");
   await page.locator("#item-text").fill(exact);
   await page.getByRole("button", { name: "Добавить", exact: true }).click();
@@ -100,6 +108,7 @@ test("text and multiple files are sent as one entry only after Add", async ({ pa
   await page.goto("/");
   await page.locator("#room-id").fill(room);
   await page.getByRole("button", { name: "Создать комнату" }).click();
+  await openComposerSettings(page);
   await page.locator("#alias").fill("Вася");
   await page.locator("#item-text").fill("Файлы к задаче");
   await expect(page.locator("#file-input")).toBeEnabled();
@@ -186,6 +195,7 @@ test("encrypted room keeps plaintext out of the server response", async ({ page,
 
   const secret = "ssh root@internal\nexport TOKEN=do-not-leak";
   const secretAlias = "Секретный Вася";
+  await openComposerSettings(page);
   await page.locator("#alias").fill(secretAlias);
   await page.locator("#item-text").fill(secret);
   const fileSecret = Buffer.from("private file bytes\n", "utf8");
@@ -295,6 +305,7 @@ test("clipboard, search, pin, favorite and clear stay client-safe", async ({ pag
   await expect(page).toHaveURL(new RegExp(`/r/${room}$`));
   await page.locator("#read-clipboard").click();
   await expect(page.locator("#item-text")).toHaveValue("from clipboard");
+  await openComposerSettings(page);
   await page.locator("#entry-ttl").selectOption("300");
   await page.getByRole("button", { name:"Добавить", exact:true }).click();
   await expect(page.locator(".item")).toHaveCount(1);
@@ -318,13 +329,82 @@ test("clipboard, search, pin, favorite and clear stay client-safe", async ({ pag
   await expect(page.locator(".item")).toHaveCount(0);
 });
 
+test("composer stays compact while advanced settings remain accessible", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name === "android-chrome", "desktop-specific bounds");
+  const room = `compact-${crypto.randomUUID()}`;
+  await page.addInitScript(() => Object.defineProperty(Navigator.prototype, "serviceWorker", { configurable:true, get:() => undefined }));
+  await page.goto("/");
+  await page.locator("#room-id").fill(room);
+  await page.getByRole("button", { name:"Создать комнату" }).click();
+  await expect(page.locator(".room-heading")).toBeVisible();
+  await expect(page.locator("#item-form")).toBeVisible();
+  const heading = await page.locator(".room-heading").boundingBox();
+  const composer = await page.locator("#item-form").boundingBox();
+  expect(heading.height).toBeLessThan(60);
+  expect(composer.height).toBeLessThan(150);
+  await expect(page.locator("#alias")).toBeHidden();
+  await page.getByText("Настройки", { exact:true }).click();
+  await expect(page.locator("#alias")).toBeVisible();
+  await page.locator("#alias").fill("Вася");
+  await page.getByText("Настройки", { exact:true }).click();
+  await page.locator("#item-text").fill("compact composer");
+  await page.getByRole("button", { name:"Добавить", exact:true }).click();
+  await expect(page.locator(".item-alias")).toHaveText("Вася");
+});
+
+test("mobile layout QR scanner accepts only rooms from the current installation", async ({ page, request }) => {
+  const room = `scan-${crypto.randomUUID()}`;
+  const created = await request.post("/api/rooms", { data:{ id:room, encrypted:false, keyId:"", writeProtected:false, writeToken:"", ttlSeconds:0 } });
+  expect(created.status()).toBe(201);
+  await page.addInitScript(() => Object.defineProperty(Navigator.prototype, "mediaDevices", { configurable:true, get:() => undefined }));
+  await page.goto("/");
+  await page.getByRole("button", { name:"QR-код" }).click();
+  await expect(page.locator("#scan-dialog")).toBeVisible();
+  await page.locator("#scan-link").fill("https://invalid.example/r/not-allowed");
+  await page.getByRole("button", { name:"Открыть", exact:true }).click();
+  await expect(page.locator("#scan-status")).toContainText("только ссылку комнаты этого Clipboard Exchange");
+  await page.locator("#scan-link").fill(`${new URL(page.url()).origin}/r/${room}`);
+  await page.getByRole("button", { name:"Открыть", exact:true }).click();
+  await expect(page).toHaveURL(new RegExp(`/r/${room}$`));
+  await expect(page.locator("#item-form")).toBeVisible();
+});
+
+test("camera QR detector opens a scanned room", async ({ page, request }, testInfo) => {
+  test.skip(testInfo.project.name !== "chrome", "native detector mock is covered once");
+  const room = `camera-scan-${crypto.randomUUID()}`;
+  const created = await request.post("/api/rooms", { data:{ id:room, encrypted:false, keyId:"", writeProtected:false, writeToken:"", ttlSeconds:0 } });
+  expect(created.status()).toBe(201);
+  await page.addInitScript(roomID => {
+    Object.defineProperty(globalThis, "BarcodeDetector", { configurable:true, value:class {
+      static async getSupportedFormats() { return ["qr_code"]; }
+      async detect() { return [{ rawValue:`/r/${roomID}` }]; }
+    } });
+    Object.defineProperty(Navigator.prototype, "mediaDevices", { configurable:true, get:() => ({ getUserMedia:async () => new MediaStream() }) });
+    Object.defineProperty(HTMLMediaElement.prototype, "readyState", { configurable:true, get:() => HTMLMediaElement.HAVE_ENOUGH_DATA });
+    HTMLMediaElement.prototype.play = async () => {};
+  }, room);
+  await page.goto("/");
+  await page.getByRole("button", { name:"QR-код" }).click();
+  await expect(page).toHaveURL(new RegExp(`/r/${room}$`));
+});
+
 test("mobile layout can create a room and show QR", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "android-chrome", "mobile-specific scenario");
   const room = `mobile-${crypto.randomUUID()}`;
+  await page.addInitScript(() => Object.defineProperty(Navigator.prototype, "serviceWorker", { configurable:true, get:() => undefined }));
   await page.goto("/");
   await page.locator("#room-id").fill(room);
   await page.getByRole("button", { name: "Создать комнату" }).click();
   await expect(page).toHaveURL(new RegExp(`/r/${room}$`));
+  await expect(page.locator("#item-form")).toBeVisible();
+  const heading = await page.locator(".room-heading").boundingBox();
+  const composer = await page.locator("#item-form").boundingBox();
+  expect(heading.height).toBeLessThan(95);
+  expect(composer.height).toBeLessThan(145);
+  await expect(page.locator("#alias")).toBeHidden();
+  await page.getByText("Настройки", { exact:true }).click();
+  await expect(page.locator("#alias")).toBeVisible();
+  await page.getByText("Настройки", { exact:true }).click();
   await page.locator("#item-text").fill("mobile smoke");
   await page.getByRole("button", { name:"Добавить", exact:true }).click();
   await expect(page.locator(".item-content")).toHaveText("mobile smoke");
