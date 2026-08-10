@@ -8,11 +8,11 @@
   <meta name="application-name" content="Clipboard Exchange">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <title>Clipboard Exchange</title>
-  <link rel="manifest" href="/assets/manifest.webmanifest?v=1">
+  <link rel="manifest" href="/assets/manifest.webmanifest?v=2">
   <link rel="icon" href="/assets/icon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/assets/style.css?v=10">
+  <link rel="stylesheet" href="/assets/style.css?v=12">
   <script defer src="/assets/qrcode.min.js"></script>
-  <script defer src="/assets/app.js?v=13"></script>
+  <script defer src="/assets/app.js?v=15"></script>
 </head>
 <body>
   <header class="topbar">
@@ -21,12 +21,15 @@
       <span>Clipboard Exchange</span>
     </a>
     <div class="top-actions">
+      <button id="scan-qr" class="button secondary compact" type="button">QR-код</button>
+      <button id="update-app" class="button primary compact hidden" type="button">Обновить</button>
       <button id="install-app" class="button secondary compact hidden" type="button">Установить</button>
       <span id="connection" class="connection hidden" role="status"></span>
     </div>
   </header>
 
   <main>
+    <div id="offline-notice" class="notice warning offline-notice hidden" role="status">Нет соединения с сервером. Интерфейс доступен offline, отправка и обновление комнат возобновятся после подключения.</div>
     <section id="home" class="panel home hidden">
       <p class="eyebrow">Общий буфер без регистрации</p>
       <h1>Переносите текст между устройствами</h1>
@@ -81,14 +84,14 @@
 
     <section id="room" class="room hidden">
       <div class="room-heading">
-        <div>
+        <div class="room-title">
           <p class="eyebrow">Комната</p>
           <h1 id="room-name"></h1>
         </div>
         <div class="room-actions">
-          <button id="favorite-room" class="button secondary" type="button">☆ В избранное</button>
-          <button id="share" class="button secondary" type="button">Поделиться</button>
-          <a class="button secondary" href="/">Новая комната</a>
+          <button id="favorite-room" class="button secondary compact" type="button">☆ В избранное</button>
+          <button id="share" class="button secondary compact" type="button">Поделиться</button>
+          <a class="button secondary compact" href="/">Новая комната</a>
         </div>
       </div>
 
@@ -97,33 +100,36 @@
       <div id="room-error" class="notice error hidden" role="alert"></div>
 
       <form id="item-form" class="composer">
-        <div class="composer-identity">
-          <label for="alias">Ваш alias</label>
-          <input id="alias" autocomplete="nickname" placeholder="Необязательно; alias никем не проверяется">
-        </div>
         <label class="sr-only" for="item-text">Текст для обмена</label>
-        <textarea id="item-text" maxlength="65536" placeholder="Текст необязателен, если выбраны файлы…" rows="5"></textarea>
-        <div class="composer-tools">
-          <button id="read-clipboard" class="button secondary compact" type="button">Вставить из буфера</button>
-          <label>Срок записи
-            <select id="entry-ttl">
-              <option value="0">Без ограничения</option>
-              <option value="300">5 минут</option>
-              <option value="3600">1 час</option>
-              <option value="86400">1 день</option>
-              <option value="604800">1 неделя</option>
-            </select>
-          </label>
-          <label class="inline-check"><input id="delete-after-download" type="checkbox"> удалить после скачивания</label>
-        </div>
-        <div id="file-drop" class="file-drop">
-          <input id="file-input" type="file" multiple>
-          <label for="file-input" class="button secondary">Добавить файлы</label>
-          <span>или перетащите их сюда</span>
-        </div>
+        <textarea id="item-text" maxlength="65536" placeholder="Введите текст или добавьте файлы…" rows="2"></textarea>
         <div id="upload-list" class="upload-list" aria-live="polite"></div>
-        <div class="composer-footer">
-          <span id="encryption-state" class="encryption-state"></span>
+        <div class="composer-bar">
+          <button id="read-clipboard" class="button secondary compact" type="button" title="Вставить из буфера обмена">Буфер</button>
+          <div id="file-drop" class="file-drop">
+            <input id="file-input" type="file" multiple>
+            <label for="file-input" class="button secondary compact">Файлы</label>
+            <span class="drop-hint">или перетащите сюда</span>
+          </div>
+          <details class="composer-options">
+            <summary class="button secondary compact">Настройки</summary>
+            <div class="composer-options-panel">
+              <div class="composer-identity">
+                <label for="alias">Ваш alias</label>
+                <input id="alias" autocomplete="nickname" placeholder="Необязательно">
+              </div>
+              <label>Срок записи
+                <select id="entry-ttl">
+                  <option value="0">Без ограничения</option>
+                  <option value="300">5 минут</option>
+                  <option value="3600">1 час</option>
+                  <option value="86400">1 день</option>
+                  <option value="604800">1 неделя</option>
+                </select>
+              </label>
+              <label class="inline-check"><input id="delete-after-download" type="checkbox"> удалить после скачивания</label>
+              <span id="encryption-state" class="encryption-state"></span>
+            </div>
+          </details>
           <button id="send" class="button primary" type="submit">Добавить</button>
         </div>
       </form>
@@ -191,6 +197,26 @@
       </div>
       <p id="share-note" class="hint"></p>
       <button id="rotate-write" class="button secondary hidden" type="button">Отозвать старые R/W-ссылки</button>
+    </div>
+  </dialog>
+
+  <dialog id="scan-dialog" class="scan-dialog">
+    <div class="dialog-card scan-card">
+      <button class="dialog-close icon-button" type="button" aria-label="Закрыть">×</button>
+      <h2>Сканировать QR-код</h2>
+      <div class="scanner-view">
+        <video id="scan-video" autoplay muted playsinline></video>
+        <span class="scanner-frame" aria-hidden="true"></span>
+      </div>
+      <p id="scan-status" class="hint" role="status">Наведите камеру на QR-код со ссылкой комнаты.</p>
+      <form id="scan-link-form" class="scan-link-form">
+        <label for="scan-link">Или вставьте ссылку комнаты</label>
+        <div class="input-action">
+          <input id="scan-link" type="url" inputmode="url" autocomplete="off" placeholder="https://…/r/room#key=…">
+          <button class="button primary" type="submit">Открыть</button>
+        </div>
+      </form>
+      <p class="hint">Камера включается только на время сканирования. Сервер не получает изображение.</p>
     </div>
   </dialog>
 

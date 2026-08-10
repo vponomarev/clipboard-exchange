@@ -4,7 +4,7 @@
   const $ = (id) => document.getElementById(id);
   const roomMatch = location.pathname.match(/^\/r\/([A-Za-z0-9][A-Za-z0-9_-]{0,63})$/);
   const fragment = new URLSearchParams(location.hash.slice(1));
-  const state = { roomID: roomMatch ? roomMatch[1] : "", room: null, key: null, keyText: "", writeToken: fragment.get("write") || "", canWrite: Boolean(fragment.get("write")), entries: [], items: [], files: [], renderedEntries: [], pendingFiles: [], capabilities: null, downloadRegistration: null, socket: null, refreshTimer: 0, previousEntryIDs: new Set(), hasRefreshed: false, unread: 0, previewIndex: 0, installPrompt: null };
+  const state = { roomID: roomMatch ? roomMatch[1] : "", room: null, key: null, keyText: "", writeToken: fragment.get("write") || "", canWrite: Boolean(fragment.get("write")), entries: [], items: [], files: [], renderedEntries: [], pendingFiles: [], capabilities: null, downloadRegistration: null, socket: null, refreshTimer: 0, previousEntryIDs: new Set(), hasRefreshed: false, unread: 0, previewIndex: 0, installPrompt: null, scanStream: null, scanTimer: 0, scanDetector: null };
   const encoder = new TextEncoder();
   const decoder = new TextDecoder("utf-8", { fatal: true });
 
@@ -145,9 +145,108 @@
   }
 
   async function initPWA() {
-    if (navigator.serviceWorker) navigator.serviceWorker.register("/assets/download-sw.js?v=7", { scope:"/" }).catch(() => {});
+    updateNetworkState();
+    addEventListener("online", () => { updateNetworkState(); toast("Соединение восстановлено"); });
+    addEventListener("offline", updateNetworkState);
+    $("scan-qr").addEventListener("click", startQRScanner);
+    $("scan-dialog").querySelector(".dialog-close").addEventListener("click", closeQRScanner);
+    $("scan-dialog").addEventListener("cancel", stopQRScanner);
+    $("scan-dialog").addEventListener("close", stopQRScanner);
+    $("scan-link-form").addEventListener("submit", event => { event.preventDefault(); openScannedRoom($("scan-link").value); });
+    $("update-app").addEventListener("click", () => location.reload());
+    if (navigator.serviceWorker) {
+      let hadController = Boolean(navigator.serviceWorker.controller);
+      navigator.serviceWorker.addEventListener("controllerchange", () => {
+        if (hadController) show("update-app");
+        hadController = true;
+      });
+      navigator.serviceWorker.register("/assets/download-sw.js?v=9", { scope:"/" }).catch(() => {});
+    }
     addEventListener("beforeinstallprompt", event => { event.preventDefault(); state.installPrompt = event; show("install-app"); });
     $("install-app").addEventListener("click", async () => { if (!state.installPrompt) return; await state.installPrompt.prompt(); state.installPrompt = null; show("install-app", false); });
+    const query = new URLSearchParams(location.search);
+    if (query.get("scan") === "1") {
+      query.delete("scan");
+      const queryText = query.toString();
+      history.replaceState(null, "", `${location.pathname}${queryText ? `?${queryText}` : ""}${location.hash}`);
+      setTimeout(startQRScanner, 0);
+    }
+  }
+
+  function updateNetworkState() {
+    show("offline-notice", !navigator.onLine);
+  }
+
+  async function startQRScanner() {
+    const dialog = $("scan-dialog");
+    if (!dialog.open) dialog.showModal();
+    $("scan-link").value = "";
+    $("scan-status").textContent = "Запрашиваем доступ к камере…";
+    try {
+      if (!isSecureContext || !navigator.mediaDevices?.getUserMedia) throw new Error("Камера доступна только через HTTPS");
+      if (!("BarcodeDetector" in globalThis)) throw new Error("Этот браузер не поддерживает распознавание QR. Вставьте ссылку вручную.");
+      const formats = await BarcodeDetector.getSupportedFormats();
+      if (!formats.includes("qr_code")) throw new Error("Распознавание QR недоступно на этом устройстве. Вставьте ссылку вручную.");
+      const stream = await navigator.mediaDevices.getUserMedia({ audio:false, video:{ facingMode:{ ideal:"environment" }, width:{ ideal:1280 }, height:{ ideal:720 } } });
+      if (!dialog.open) { stream.getTracks().forEach(track => track.stop()); return; }
+      state.scanStream = stream;
+      state.scanDetector = new BarcodeDetector({ formats:["qr_code"] });
+      const video = $("scan-video"); video.srcObject = stream; await video.play();
+      $("scan-status").textContent = "Наведите камеру на QR-код со ссылкой комнаты.";
+      scanQRFrame();
+    } catch (error) {
+      stopQRScanner();
+      $("scan-status").textContent = `Камера недоступна: ${error.message}`;
+    }
+  }
+
+  async function scanQRFrame() {
+    if (!$("scan-dialog").open || !state.scanDetector) return;
+    try {
+      const video = $("scan-video");
+      if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+        const codes = await state.scanDetector.detect(video);
+        const value = codes.find(code => code.rawValue)?.rawValue;
+        if (value && openScannedRoom(value)) return;
+      }
+    } catch (error) {
+      $("scan-status").textContent = `Ошибка распознавания: ${error.message}`;
+    }
+    state.scanTimer = setTimeout(scanQRFrame, 160);
+  }
+
+  function scannedRoomTarget(value) {
+    const text = String(value || "").trim();
+    if (!text || text.length > 4096) throw new Error("QR-код не содержит корректную ссылку комнаты");
+    const url = new URL(text, location.origin);
+    if (url.origin !== location.origin || url.username || url.password || !/^\/r\/[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(url.pathname)) {
+      throw new Error("Можно открыть только ссылку комнаты этого Clipboard Exchange");
+    }
+    return `${url.pathname}${url.search}${url.hash}`;
+  }
+
+  function openScannedRoom(value) {
+    try {
+      const target = scannedRoomTarget(value);
+      stopQRScanner();
+      if ($("scan-dialog").open) $("scan-dialog").close();
+      location.assign(target);
+      return true;
+    } catch (error) {
+      $("scan-status").textContent = error.message;
+      return false;
+    }
+  }
+
+  function stopQRScanner() {
+    clearTimeout(state.scanTimer); state.scanTimer = 0; state.scanDetector = null;
+    state.scanStream?.getTracks().forEach(track => track.stop()); state.scanStream = null;
+    $("scan-video").pause(); $("scan-video").srcObject = null;
+  }
+
+  function closeQRScanner() {
+    stopQRScanner();
+    if ($("scan-dialog").open) $("scan-dialog").close();
   }
 
   function renderRecentRooms() {
@@ -211,7 +310,7 @@
   }
 
   async function initRoom() {
-    show("room"); $("room-name").textContent = state.roomID;
+    show("room"); $("room-name").textContent = state.roomID; $("room-name").title = state.roomID;
 	$("alias").value = loadAlias();
 	const remembered = await loadRememberedSecrets();
 	$("remember-room").checked = remembered;
@@ -283,7 +382,11 @@
 
   function updateFavoriteButton() {
 	const favorite = Boolean(loadRecentRooms().find(room => room.id === state.roomID)?.favorite);
-	$("favorite-room").textContent = favorite ? "★ В избранном" : "☆ В избранное";
+	const button = $("favorite-room");
+	button.textContent = favorite ? "★ В избранном" : "☆ В избранное";
+	button.classList.toggle("favorite-active", favorite);
+	button.setAttribute("aria-label", favorite ? "Удалить из избранного" : "Добавить в избранное");
+	button.title = button.getAttribute("aria-label");
   }
 
   async function readClipboard() {
@@ -591,7 +694,7 @@
 
   async function ensureDownloadWorker() {
     if (!navigator.serviceWorker) throw new Error("Браузер не поддерживает потоковое скачивание зашифрованных файлов");
-    state.downloadRegistration = await navigator.serviceWorker.register("/assets/download-sw.js?v=7", { scope:"/" });
+    state.downloadRegistration = await navigator.serviceWorker.register("/assets/download-sw.js?v=9", { scope:"/" });
     await navigator.serviceWorker.ready;
     if (!navigator.serviceWorker.controller) {
       await new Promise((resolve, reject) => {

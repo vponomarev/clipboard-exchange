@@ -2,8 +2,8 @@
 
 const downloads = new Map();
 const encoder = new TextEncoder();
-const appCache = "clipboard-exchange-shell-v5";
-const shell = ["/", "/assets/style.css?v=10", "/assets/app.js?v=13", "/assets/qrcode.min.js", "/assets/manifest.webmanifest?v=1", "/assets/icon.svg", "/assets/icon-192.png", "/assets/icon-512.png"];
+const appCache = "clipboard-exchange-shell-v7";
+const shell = ["/", "/assets/style.css?v=12", "/assets/app.js?v=15", "/assets/qrcode.min.js", "/assets/manifest.webmanifest?v=2", "/assets/icon.svg", "/assets/icon-192.png", "/assets/icon-512.png"];
 
 self.addEventListener("install", (event) => event.waitUntil(caches.open(appCache).then(cache => cache.addAll(shell)).then(() => self.skipWaiting())));
 self.addEventListener("activate", (event) => event.waitUntil(Promise.all([caches.keys().then(keys => Promise.all(keys.filter(key => key !== appCache).map(key => caches.delete(key)))), self.clients.claim()])));
@@ -36,7 +36,7 @@ self.addEventListener("fetch", (event) => {
 async function cacheAsset(request) {
   const cache = await caches.open(appCache);
   const cached = await cache.match(request);
-  const network = fetch(request).then(response => { if (response.ok) cache.put(request, response.clone()); return response; });
+  const network = fetch(request).then(response => { if (response.ok) cache.put(request, response.clone()); return response; }).catch(() => cached || Response.error());
   return cached || network;
 }
 
