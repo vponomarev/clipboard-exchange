@@ -251,3 +251,108 @@ func TestUploadReservationsEnforceRoomQuota(t *testing.T) {
 		t.Fatalf("completed file was not counted in quota: %v", err)
 	}
 }
+
+func TestAtomicEntryIsInvisibleUntilEveryFileIsCommitted(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	if err := s.CreateRoom(ctx, Room{ID: "atomic"}, 10); err != nil {
+		t.Fatal(err)
+	}
+	entryID := "123e4567-e89b-12d3-a456-426614174010"
+	item := &Item{Kind: "text", Content: "command\nwith exact spacing"}
+	if err := s.CreateEntry(ctx, "atomic", Entry{ID: entryID, ExpectedFiles: 1}, item, 10); err != nil {
+		t.Fatal(err)
+	}
+	items, _ := s.ListItems(ctx, "atomic")
+	entries, _ := s.ListEntries(ctx, "atomic")
+	if len(items) != 0 || len(entries) != 0 {
+		t.Fatalf("draft leaked: items=%#v entries=%#v", items, entries)
+	}
+	if err := s.CommitEntry(ctx, "atomic", entryID); !errors.Is(err, ErrConflict) {
+		t.Fatalf("incomplete entry committed: %v", err)
+	}
+	upload := Upload{ID: "123e4567-e89b-12d3-a456-426614174011", RoomID: "atomic", FileID: "123e4567-e89b-12d3-a456-426614174012", EntryID: entryID, EntryIndex: 0, Name: "note.txt", MIMEType: "text/plain", Size: 1, ChunkSize: 1, PlainChunkSize: 1, ChunkCount: 1, TokenHash: "token", ExpiresAt: time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano)}
+	if err := s.CreateUpload(ctx, upload, 10, 10); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordChunk(ctx, upload.ID, 0, 1, "digest", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CompleteUpload(ctx, "atomic", upload.ID, "", "", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CommitEntry(ctx, "atomic", entryID); err != nil {
+		t.Fatal(err)
+	}
+	items, _ = s.ListItems(ctx, "atomic")
+	files, _ := s.ListFiles(ctx, "atomic")
+	entries, _ = s.ListEntries(ctx, "atomic")
+	if len(items) != 1 || len(files) != 1 || len(entries) != 1 || !entries[0].Published {
+		t.Fatalf("committed group is incomplete: items=%#v files=%#v entries=%#v", items, files, entries)
+	}
+	if err := s.PinEntry(ctx, "atomic", entryID, true); err != nil {
+		t.Fatal(err)
+	}
+	entries, _ = s.ListEntries(ctx, "atomic")
+	if len(entries) != 1 || !entries[0].Pinned {
+		t.Fatalf("pin was not persisted: %#v", entries)
+	}
+	deleted, err := s.ClearRoom(ctx, "atomic")
+	if err != nil || len(deleted.FileIDs) != 1 {
+		t.Fatalf("clear: deleted=%#v err=%v", deleted, err)
+	}
+	if items, _ := s.ListItems(ctx, "atomic"); len(items) != 0 {
+		t.Fatal("clear left an item behind")
+	}
+}
+
+func TestEntryAndRoomTTL(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	if err := s.CreateRoom(ctx, Room{ID: "ttl", TTLSeconds: 60}, 10); err != nil {
+		t.Fatal(err)
+	}
+	entryID := "123e4567-e89b-12d3-a456-426614174020"
+	past := time.Now().Add(-time.Minute).UTC().Format(time.RFC3339Nano)
+	if err := s.CreateEntry(ctx, "ttl", Entry{ID: entryID, ExpiresAt: past}, &Item{Kind: "text", Content: "temporary"}, 10); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CommitEntry(ctx, "ttl", entryID); err != nil {
+		t.Fatal(err)
+	}
+	if items, _ := s.ListItems(ctx, "ttl"); len(items) != 0 {
+		t.Fatal("expired entry was listed")
+	}
+	if _, err := s.DeleteExpiredEntries(ctx, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.GetEntry(ctx, "ttl", entryID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expired entry remains: %v", err)
+	}
+	if _, err := s.db.Exec(`UPDATE rooms SET updated_at=? WHERE id='ttl'`, time.Now().Add(-2*time.Minute).UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	count, err := s.DeleteExpiredRooms(ctx, time.Now(), 0)
+	if err != nil || count != 1 {
+		t.Fatalf("custom room TTL: count=%d err=%v", count, err)
+	}
+}
+
+func TestSnapshotOpensAsIndependentDatabase(t *testing.T) {
+	s := testStore(t)
+	if err := s.CreateRoom(context.Background(), Room{ID: "snapshot"}, 10); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "snapshot.db")
+	if err := s.Snapshot(context.Background(), path); err != nil {
+		t.Fatal(err)
+	}
+	copy, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer copy.Close()
+	if _, err := copy.GetRoom(context.Background(), "snapshot"); err != nil {
+		t.Fatal(err)
+	}
+}

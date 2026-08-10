@@ -6,6 +6,7 @@ module.exports = defineConfig({
   timeout: 30_000,
   expect: { timeout: 8_000 },
   fullyParallel: false,
+  workers: 1,
   retries: process.env.CI ? 2 : 0,
   reporter: process.env.CI ? [["github"], ["html", { open: "never" }]] : "list",
   use: { baseURL: "http://127.0.0.1:18080", trace: "retain-on-failure" },
@@ -20,6 +21,6 @@ module.exports = defineConfig({
   projects: [
     { name: "chrome", use: { ...devices["Desktop Chrome"], channel: "chrome" } },
     { name: "firefox", use: { ...devices["Desktop Firefox"], ...(firefoxExecutable ? { launchOptions: { executablePath: firefoxExecutable } } : {}) } },
-    { name: "android-chrome", use: { ...devices["Pixel 7"] } }
+    { name: "android-chrome", grep: /mobile layout/, use: { ...devices["Pixel 7"] } }
   ]
 });

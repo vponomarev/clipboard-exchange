@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/vponomarev/clipboard-exchange/internal/admin"
 	"github.com/vponomarev/clipboard-exchange/internal/config"
 	"github.com/vponomarev/clipboard-exchange/internal/filestore"
 	"github.com/vponomarev/clipboard-exchange/internal/httpserver"
@@ -25,6 +26,13 @@ func main() {
 	if len(os.Args) > 1 && systemd.IsCommand(os.Args[1]) {
 		if err := systemd.Run(os.Args[1:], version); err != nil {
 			log.Printf("systemd: %v", err)
+			os.Exit(1)
+		}
+		return
+	}
+	if len(os.Args) > 1 && admin.IsCommand(os.Args[1]) {
+		if err := admin.Run(os.Args[1:], version); err != nil {
+			log.Printf("admin: %v", err)
 			os.Exit(1)
 		}
 		return
@@ -72,8 +80,7 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	go db.RunCleanup(ctx, cfg.RoomTTL, time.Hour)
-	go runUploadCleanup(ctx, db, files)
+	go runUploadCleanup(ctx, db, files, cfg.RoomTTL, cfg.MaxFileBytes)
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -102,8 +109,26 @@ func main() {
 	}
 }
 
-func runUploadCleanup(ctx context.Context, db *store.Store, files *filestore.Store) {
+func runUploadCleanup(ctx context.Context, db *store.Store, files *filestore.Store, roomTTL time.Duration, warningBytes int64) {
 	cleanup := func() {
+		if _, err := db.DeleteExpiredRooms(ctx, time.Now(), roomTTL); err != nil {
+			log.Printf("cleanup expired rooms: %v", err)
+		}
+		expiredEntries, err := db.DeleteExpiredEntries(ctx, time.Now())
+		if err != nil {
+			log.Printf("cleanup expired entries: %v", err)
+		} else {
+			for _, id := range expiredEntries.FileIDs {
+				if err := files.RemoveObject(id); err != nil {
+					log.Printf("cleanup expired entry object %s: %v", id, err)
+				}
+			}
+			for _, id := range expiredEntries.UploadIDs {
+				if err := files.RemoveUpload(id); err != nil {
+					log.Printf("cleanup expired entry upload %s: %v", id, err)
+				}
+			}
+		}
 		ids, err := db.DeleteExpiredUploads(ctx, time.Now())
 		if err != nil {
 			log.Printf("cleanup expired uploads: %v", err)
@@ -121,6 +146,9 @@ func runUploadCleanup(ctx context.Context, db *store.Store, files *filestore.Sto
 		}
 		if err := files.Reconcile(activeUploads, activeObjects); err != nil {
 			log.Printf("reconcile file storage: %v", err)
+		}
+		if available, total, err := files.DiskSpace(); err == nil && (available < uint64(warningBytes) || (total > 0 && available < total/20)) {
+			log.Printf("WARNING: file storage disk space is low available_bytes=%d total_bytes=%d", available, total)
 		}
 	}
 	cleanup()

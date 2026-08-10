@@ -2,21 +2,67 @@
 
 const downloads = new Map();
 const encoder = new TextEncoder();
+const appCache = "clipboard-exchange-shell-v5";
+const shell = ["/", "/assets/style.css?v=10", "/assets/app.js?v=13", "/assets/qrcode.min.js", "/assets/manifest.webmanifest?v=1", "/assets/icon.svg", "/assets/icon-192.png", "/assets/icon-512.png"];
 
-self.addEventListener("install", () => self.skipWaiting());
-self.addEventListener("activate", (event) => event.waitUntil(self.clients.claim()));
+self.addEventListener("install", (event) => event.waitUntil(caches.open(appCache).then(cache => cache.addAll(shell)).then(() => self.skipWaiting())));
+self.addEventListener("activate", (event) => event.waitUntil(Promise.all([caches.keys().then(keys => Promise.all(keys.filter(key => key !== appCache).map(key => caches.delete(key)))), self.clients.claim()])));
 self.addEventListener("message", (event) => {
   if (event.data?.type !== "prepare-download" || !event.data.token) return;
   downloads.set(event.data.token, event.data.config);
   event.ports[0]?.postMessage({ ready:true });
 });
 self.addEventListener("fetch", (event) => {
-  const match = new URL(event.request.url).pathname.match(/^\/client-download\/([0-9a-f-]{36})$/);
-  if (!match) return;
-  const config = downloads.get(match[1]);
-  if (!config) { event.respondWith(new Response("Download session expired", { status:404 })); return; }
-  event.respondWith(streamDownload(config));
+  const url = new URL(event.request.url);
+  const match = url.pathname.match(/^\/client-download\/([0-9a-f-]{36})$/);
+  if (match) {
+    const config = downloads.get(match[1]);
+    if (!config) { event.respondWith(new Response("Download session expired", { status:404 })); return; }
+    event.respondWith(streamDownload(config));
+    return;
+  }
+  if (event.request.method === "POST" && url.pathname === "/share-target") {
+    event.respondWith(receiveShare(event.request));
+    return;
+  }
+  if (event.request.method !== "GET" || url.origin !== location.origin || url.pathname.startsWith("/api/") || url.pathname === "/metrics") return;
+  if (event.request.mode === "navigate") {
+    event.respondWith(fetch(event.request).catch(() => caches.match("/")));
+    return;
+  }
+  if (url.pathname.startsWith("/assets/")) event.respondWith(cacheAsset(event.request));
 });
+
+async function cacheAsset(request) {
+  const cache = await caches.open(appCache);
+  const cached = await cache.match(request);
+  const network = fetch(request).then(response => { if (response.ok) cache.put(request, response.clone()); return response; });
+  return cached || network;
+}
+
+async function receiveShare(request) {
+  const form = await request.formData();
+  const files = form.getAll("files").filter(value => value instanceof File && value.size >= 0);
+  await putShared({ id:"pending", title:String(form.get("title") || ""), text:String(form.get("text") || ""), url:String(form.get("url") || ""), files, createdAt:Date.now() });
+  return Response.redirect("/?shared=1", 303);
+}
+
+function putShared(value) {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open("clipboard-exchange-pwa", 2);
+    request.onupgradeneeded = () => {
+      if (!request.result.objectStoreNames.contains("shared")) request.result.createObjectStore("shared", { keyPath:"id" });
+      if (!request.result.objectStoreNames.contains("vault")) request.result.createObjectStore("vault", { keyPath:"id" });
+    };
+    request.onerror = () => reject(request.error);
+    request.onsuccess = () => {
+      const tx = request.result.transaction("shared", "readwrite");
+      tx.objectStore("shared").put(value);
+      tx.oncomplete = () => { request.result.close(); resolve(); };
+      tx.onerror = () => reject(tx.error);
+    };
+  });
+}
 
 async function streamDownload(config) {
   const key = await crypto.subtle.importKey("raw", fromB64url(config.rawKey), "AES-GCM", false, ["decrypt"]);
@@ -36,6 +82,7 @@ async function streamDownload(config) {
           const remaining = config.size - index * config.chunkSize;
           controller.enqueue(plaintext.slice(0, Math.min(config.chunkSize, remaining)));
         }
+		if (config.consumeURL) await fetch(config.consumeURL, { method:"POST", cache:"no-store" });
         controller.close();
       } catch (error) { controller.error(error); }
     }

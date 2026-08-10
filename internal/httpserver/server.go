@@ -1,15 +1,19 @@
 package httpserver
 
 import (
+	"bytes"
+	"compress/zlib"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"embed"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"io/fs"
 	"log"
@@ -46,23 +50,29 @@ type Server struct {
 	hub     *hub
 	limiter *rateLimiter
 	static  http.Handler
+	started time.Time
 }
 
 type roomResponse struct {
-	Room  store.Room   `json:"room"`
-	Items []store.Item `json:"items"`
-	Files []store.File `json:"files"`
+	Room    store.Room    `json:"room"`
+	Entries []store.Entry `json:"entries"`
+	Items   []store.Item  `json:"items"`
+	Files   []store.File  `json:"files"`
 }
 
 func New(cfg config.Config, db *store.Store, files *filestore.Store, logger *log.Logger) http.Handler {
 	assets, _ := fs.Sub(webFiles, "web")
-	s := &Server{cfg: cfg, store: db, files: files, log: logger, hub: newHub(), limiter: newRateLimiter(cfg.RateLimit), static: http.FileServer(http.FS(assets))}
+	s := &Server{cfg: cfg, store: db, files: files, log: logger, hub: newHub(), limiter: newRateLimiter(cfg.RateLimit), static: http.FileServer(http.FS(assets)), started: time.Now()}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
 	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
 	mux.HandleFunc("GET /api/capabilities", s.capabilities)
 	mux.HandleFunc("POST /api/rooms", s.createRoom)
 	mux.HandleFunc("GET /api/rooms/{room}", s.getRoom)
+	mux.HandleFunc("POST /api/rooms/{room}/entries", s.createEntry)
+	mux.HandleFunc("POST /api/rooms/{room}/entries/{entry}/commit", s.commitEntry)
+	mux.HandleFunc("PUT /api/rooms/{room}/entries/{entry}/pin", s.pinEntry)
+	mux.HandleFunc("POST /api/rooms/{room}/clear", s.clearRoom)
 	mux.HandleFunc("POST /api/rooms/{room}/write-capability/rotate", s.rotateWriteCapability)
 	mux.HandleFunc("POST /api/rooms/{room}/uploads", s.createUpload)
 	mux.HandleFunc("GET /api/rooms/{room}/uploads/{upload}", s.getUpload)
@@ -70,19 +80,25 @@ func New(cfg config.Config, db *store.Store, files *filestore.Store, logger *log
 	mux.HandleFunc("POST /api/rooms/{room}/uploads/{upload}/complete", s.completeUpload)
 	mux.HandleFunc("DELETE /api/rooms/{room}/uploads/{upload}", s.abortUpload)
 	mux.HandleFunc("GET /api/rooms/{room}/files/{file}", s.downloadFile)
+	mux.HandleFunc("POST /api/rooms/{room}/files/{file}/consume", s.consumeFile)
 	mux.HandleFunc("DELETE /api/rooms/{room}/files/{file}", s.deleteFile)
 	mux.HandleFunc("DELETE /api/rooms/{room}/entries/{entry}", s.deleteEntry)
 	mux.HandleFunc("POST /api/rooms/{room}/items", s.addItem)
 	mux.HandleFunc("DELETE /api/rooms/{room}/items/{item}", s.deleteItem)
 	mux.HandleFunc("GET /api/rooms/{room}/events", s.events)
+	mux.HandleFunc("GET /metrics", s.metrics)
+	mux.HandleFunc("GET /assets/icon-192.png", func(w http.ResponseWriter, _ *http.Request) { serveIcon(w, 192) })
+	mux.HandleFunc("GET /assets/icon-512.png", func(w http.ResponseWriter, _ *http.Request) { serveIcon(w, 512) })
 	mux.HandleFunc("GET /assets/", s.asset)
 	mux.HandleFunc("GET /r/{room}", s.page)
+	mux.HandleFunc("GET /share-target", s.page)
+	mux.HandleFunc("POST /share-target", s.shareTargetFallback)
 	mux.HandleFunc("GET /", s.page)
 	return s.security(s.logging(mux))
 }
 
 func (s *Server) page(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" && !roomIDPattern.MatchString(r.PathValue("room")) {
+	if r.URL.Path != "/" && r.URL.Path != "/share-target" && !roomIDPattern.MatchString(r.PathValue("room")) {
 		http.NotFound(w, r)
 		return
 	}
@@ -117,6 +133,7 @@ func (s *Server) createRoom(w http.ResponseWriter, r *http.Request) {
 		KeyID          string `json:"keyId"`
 		WriteProtected *bool  `json:"writeProtected"`
 		WriteToken     string `json:"writeToken"`
+		TTLSeconds     int64  `json:"ttlSeconds"`
 	}
 	if !decodeJSON(w, r, &req, 4096) {
 		return
@@ -131,11 +148,11 @@ func (s *Server) createRoom(w http.ResponseWriter, r *http.Request) {
 	if writeProtected {
 		writeHash, validWriteToken = hashWriteToken(req.WriteToken)
 	}
-	if !roomIDPattern.MatchString(req.ID) || !validWriteToken || (req.Encrypted && !validToken(req.KeyID, 43, 64)) || (!req.Encrypted && req.KeyID != "") {
+	if !roomIDPattern.MatchString(req.ID) || !validWriteToken || req.TTLSeconds < 0 || req.TTLSeconds > 365*24*60*60 || (req.Encrypted && !validToken(req.KeyID, 43, 64)) || (!req.Encrypted && req.KeyID != "") {
 		writeError(w, http.StatusBadRequest, "invalid_room", "Room ID or encryption metadata is invalid")
 		return
 	}
-	err := s.store.CreateRoom(r.Context(), store.Room{ID: req.ID, Encrypted: req.Encrypted, KeyID: req.KeyID, WriteProtected: writeProtected, WriteHash: writeHash}, s.cfg.MaxRooms)
+	err := s.store.CreateRoom(r.Context(), store.Room{ID: req.ID, Encrypted: req.Encrypted, KeyID: req.KeyID, WriteProtected: writeProtected, WriteHash: writeHash, TTLSeconds: req.TTLSeconds}, s.cfg.MaxRooms)
 	if err != nil {
 		s.storeError(w, err)
 		return
@@ -146,11 +163,15 @@ func (s *Server) createRoom(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) capabilities(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
-		"protocolVersion":        4,
+		"protocolVersion":        5,
 		"writeCapabilities":      true,
 		"openWriteRooms":         true,
 		"groupedAttachments":     true,
 		"inlineFiles":            true,
+		"atomicEntries":          true,
+		"entryTTL":               true,
+		"roomTTL":                true,
+		"pwa":                    true,
 		"aliases":                true,
 		"encryptedTextVersions":  []int{1, 2},
 		"files":                  true,
@@ -189,7 +210,104 @@ func (s *Server) getRoom(w http.ResponseWriter, r *http.Request) {
 		s.storeError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, roomResponse{Room: room, Items: items, Files: files})
+	entries, err := s.store.ListEntries(r.Context(), roomID)
+	if err != nil {
+		s.storeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, roomResponse{Room: room, Entries: entries, Items: items, Files: files})
+}
+
+func (s *Server) shareTargetFallback(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1024)
+	_, _ = io.Copy(io.Discard, r.Body)
+	http.Redirect(w, r, "/?share=unsupported", http.StatusSeeOther)
+}
+
+func (s *Server) createEntry(w http.ResponseWriter, r *http.Request) {
+	roomID := r.PathValue("room")
+	if !roomIDPattern.MatchString(roomID) || !s.authorizeMutation(w, r, roomID) {
+		return
+	}
+	var req struct {
+		ID                  string      `json:"id"`
+		ExpectedFiles       int         `json:"expectedFiles"`
+		ExpiresInSeconds    int64       `json:"expiresInSeconds"`
+		DeleteAfterDownload bool        `json:"deleteAfterDownload"`
+		Item                *store.Item `json:"item"`
+	}
+	if !decodeJSON(w, r, &req, s.cfg.MaxItemBytes*2+8192) {
+		return
+	}
+	if !objectIDPattern.MatchString(req.ID) || req.ExpectedFiles < 0 || req.ExpectedFiles > 100 || req.ExpiresInSeconds < 0 || req.ExpiresInSeconds > 30*24*60*60 || (req.Item == nil && req.ExpectedFiles == 0) || (req.DeleteAfterDownload && (req.ExpectedFiles != 1 || req.Item != nil)) {
+		writeError(w, http.StatusBadRequest, "invalid_entry", "Invalid entry metadata")
+		return
+	}
+	if req.Item != nil {
+		req.Item.ID = req.ID
+		req.Item.CreatedAt = ""
+		if !validItem(*req.Item, s.cfg.MaxItemBytes) {
+			writeError(w, http.StatusBadRequest, "invalid_item", "Invalid entry text")
+			return
+		}
+	}
+	expiresAt := ""
+	if req.ExpiresInSeconds > 0 {
+		expiresAt = time.Now().Add(time.Duration(req.ExpiresInSeconds) * time.Second).UTC().Format(time.RFC3339Nano)
+	}
+	entry := store.Entry{ID: req.ID, ExpectedFiles: req.ExpectedFiles, ExpiresAt: expiresAt, DeleteAfterDownload: req.DeleteAfterDownload}
+	if err := s.store.CreateEntry(r.Context(), roomID, entry, req.Item, s.cfg.MaxItemsPerRoom); err != nil {
+		s.storeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]string{"id": req.ID})
+}
+
+func (s *Server) commitEntry(w http.ResponseWriter, r *http.Request) {
+	roomID, entryID := r.PathValue("room"), r.PathValue("entry")
+	if !roomIDPattern.MatchString(roomID) || !objectIDPattern.MatchString(entryID) || !s.authorizeMutation(w, r, roomID) {
+		return
+	}
+	if err := s.store.CommitEntry(r.Context(), roomID, entryID); err != nil {
+		s.storeError(w, err)
+		return
+	}
+	s.hub.broadcast(roomID)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) pinEntry(w http.ResponseWriter, r *http.Request) {
+	roomID, entryID := r.PathValue("room"), r.PathValue("entry")
+	if !roomIDPattern.MatchString(roomID) || !objectIDPattern.MatchString(entryID) || !s.authorizeMutation(w, r, roomID) {
+		return
+	}
+	var req struct {
+		Pinned bool `json:"pinned"`
+	}
+	if !decodeJSON(w, r, &req, 128) {
+		return
+	}
+	if err := s.store.PinEntry(r.Context(), roomID, entryID, req.Pinned); err != nil {
+		s.storeError(w, err)
+		return
+	}
+	s.hub.broadcast(roomID)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) clearRoom(w http.ResponseWriter, r *http.Request) {
+	roomID := r.PathValue("room")
+	if !roomIDPattern.MatchString(roomID) || !s.authorizeMutation(w, r, roomID) {
+		return
+	}
+	deleted, err := s.store.ClearRoom(r.Context(), roomID)
+	if err != nil {
+		s.storeError(w, err)
+		return
+	}
+	s.removeDeletedObjects(deleted)
+	s.hub.broadcast(roomID)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) addItem(w http.ResponseWriter, r *http.Request) {
@@ -209,18 +327,7 @@ func (s *Server) addItem(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "invalid_item", "Invalid item ID")
 		return
 	}
-	switch item.Kind {
-	case "text":
-		if item.Content == "" || int64(len([]byte(item.Content))) > s.cfg.MaxItemBytes || !validAlias(item.Alias) || item.Ciphertext != "" || item.IV != "" || item.KeyID != "" {
-			writeError(w, 400, "invalid_item", "Invalid text item")
-			return
-		}
-	case "encrypted":
-		if (item.Version != 1 && item.Version != 2) || !validToken(item.IV, 16, 24) || !validToken(item.KeyID, 43, 64) || !validToken(item.Ciphertext, 20, int(s.cfg.MaxItemBytes*2)) || item.Content != "" || item.Alias != "" {
-			writeError(w, 400, "invalid_item", "Invalid encrypted item")
-			return
-		}
-	default:
+	if !validItem(item, s.cfg.MaxItemBytes) {
 		writeError(w, 400, "invalid_item", "Unsupported item kind")
 		return
 	}
@@ -476,7 +583,10 @@ func (s *Server) completeUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_ = s.files.RemoveUpload(upload.ID)
-	s.hub.broadcast(upload.RoomID)
+	entry, entryErr := s.store.GetEntry(r.Context(), upload.RoomID, upload.EntryID)
+	if errors.Is(entryErr, store.ErrNotFound) || (entryErr == nil && entry.Published) {
+		s.hub.broadcast(upload.RoomID)
+	}
 	writeJSON(w, http.StatusCreated, file)
 }
 
@@ -514,7 +624,6 @@ func (s *Server) downloadFile(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "storage_unavailable", "Could not open stored file")
 		return
 	}
-	defer object.Close()
 	created, _ := time.Parse(time.RFC3339Nano, file.CreatedAt)
 	contentType, filename := file.MIMEType, file.Name
 	if file.Encrypted {
@@ -529,6 +638,19 @@ func (s *Server) downloadFile(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("ETag", `"`+file.ID+`"`)
 	w.Header().Set("Cache-Control", "private, no-store")
 	http.ServeContent(w, r, file.Name, created, object)
+	if err := object.Close(); err != nil {
+		s.log.Printf("close stored file %s: %v", fileID, err)
+	}
+	if r.Header.Get("Range") == "" {
+		entry, err := s.store.EntryForFile(context.Background(), roomID, fileID)
+		if err == nil && entry.DeleteAfterDownload {
+			deleted, deleteErr := s.store.DeleteEntry(context.Background(), roomID, entry.ID)
+			if deleteErr == nil {
+				s.removeDeletedObjects(deleted)
+				s.hub.broadcast(roomID)
+			}
+		}
+	}
 }
 
 func (s *Server) deleteFile(w http.ResponseWriter, r *http.Request) {
@@ -551,6 +673,27 @@ func (s *Server) deleteFile(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func (s *Server) consumeFile(w http.ResponseWriter, r *http.Request) {
+	roomID, fileID := r.PathValue("room"), r.PathValue("file")
+	if !roomIDPattern.MatchString(roomID) || !objectIDPattern.MatchString(fileID) {
+		writeError(w, http.StatusBadRequest, "invalid_file", "Invalid room or file ID")
+		return
+	}
+	entry, err := s.store.EntryForFile(r.Context(), roomID, fileID)
+	if err != nil || !entry.DeleteAfterDownload {
+		writeError(w, http.StatusConflict, "not_download_once", "File is not configured for deletion after download")
+		return
+	}
+	deleted, err := s.store.DeleteEntry(r.Context(), roomID, entry.ID)
+	if err != nil {
+		s.storeError(w, err)
+		return
+	}
+	s.removeDeletedObjects(deleted)
+	s.hub.broadcast(roomID)
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (s *Server) deleteEntry(w http.ResponseWriter, r *http.Request) {
 	roomID, entryID := r.PathValue("room"), r.PathValue("entry")
 	if !roomIDPattern.MatchString(roomID) || !objectIDPattern.MatchString(entryID) {
@@ -560,16 +703,12 @@ func (s *Server) deleteEntry(w http.ResponseWriter, r *http.Request) {
 	if !s.authorizeMutation(w, r, roomID) {
 		return
 	}
-	fileIDs, err := s.store.DeleteEntry(r.Context(), roomID, entryID)
+	deleted, err := s.store.DeleteEntry(r.Context(), roomID, entryID)
 	if err != nil {
 		s.storeError(w, err)
 		return
 	}
-	for _, fileID := range fileIDs {
-		if err := s.files.RemoveObject(fileID); err != nil {
-			s.log.Printf("remove entry file object: %v", err)
-		}
-	}
+	s.removeDeletedObjects(deleted)
 	s.hub.broadcast(roomID)
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -741,7 +880,7 @@ func (s *Server) storeError(w http.ResponseWriter, err error) {
 
 func (s *Server) security(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; connect-src 'self' ws: wss:; img-src 'self' data:; style-src 'self'; script-src 'self'; worker-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; connect-src 'self' ws: wss:; img-src 'self' data: blob:; media-src 'self' blob:; frame-src 'self'; manifest-src 'self'; style-src 'self'; script-src 'self'; worker-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; object-src 'none'")
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
@@ -792,6 +931,48 @@ func validToken(v string, min, max int) bool {
 
 func validAlias(alias string) bool {
 	return utf8.ValidString(alias) && utf8.RuneCountInString(alias) <= 64
+}
+
+func (s *Server) removeDeletedObjects(deleted store.DeletedObjects) {
+	for _, fileID := range deleted.FileIDs {
+		if err := s.files.RemoveObject(fileID); err != nil {
+			s.log.Printf("remove entry file object: %v", err)
+		}
+	}
+	for _, uploadID := range deleted.UploadIDs {
+		if err := s.files.RemoveUpload(uploadID); err != nil {
+			s.log.Printf("remove entry upload: %v", err)
+		}
+	}
+}
+
+func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
+	stats, err := s.store.Stats(r.Context())
+	if err != nil {
+		s.storeError(w, err)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = fmt.Fprintf(w, "# HELP clipboard_exchange_rooms Current rooms.\n# TYPE clipboard_exchange_rooms gauge\nclipboard_exchange_rooms %d\n", stats.Rooms)
+	_, _ = fmt.Fprintf(w, "# HELP clipboard_exchange_entries Atomic entry metadata rows.\n# TYPE clipboard_exchange_entries gauge\nclipboard_exchange_entries %d\n", stats.Entries)
+	_, _ = fmt.Fprintf(w, "# HELP clipboard_exchange_items Text payload rows.\n# TYPE clipboard_exchange_items gauge\nclipboard_exchange_items %d\n", stats.Items)
+	_, _ = fmt.Fprintf(w, "# HELP clipboard_exchange_files Stored files.\n# TYPE clipboard_exchange_files gauge\nclipboard_exchange_files %d\n", stats.Files)
+	_, _ = fmt.Fprintf(w, "# HELP clipboard_exchange_file_bytes Stored file bytes.\n# TYPE clipboard_exchange_file_bytes gauge\nclipboard_exchange_file_bytes %d\n", stats.FileBytes)
+	_, _ = fmt.Fprintf(w, "# HELP clipboard_exchange_active_uploads Active upload sessions.\n# TYPE clipboard_exchange_active_uploads gauge\nclipboard_exchange_active_uploads %d\n", stats.ActiveUploads)
+	_, _ = fmt.Fprintf(w, "# HELP clipboard_exchange_reserved_bytes Reserved upload bytes.\n# TYPE clipboard_exchange_reserved_bytes gauge\nclipboard_exchange_reserved_bytes %d\n", stats.ReservedBytes)
+	_, _ = fmt.Fprintf(w, "# HELP clipboard_exchange_uptime_seconds Process uptime.\n# TYPE clipboard_exchange_uptime_seconds gauge\nclipboard_exchange_uptime_seconds %.0f\n", time.Since(s.started).Seconds())
+}
+
+func validItem(item store.Item, maxItemBytes int64) bool {
+	switch item.Kind {
+	case "text":
+		return item.Content != "" && int64(len([]byte(item.Content))) <= maxItemBytes && validAlias(item.Alias) && item.Ciphertext == "" && item.IV == "" && item.KeyID == ""
+	case "encrypted":
+		return (item.Version == 1 || item.Version == 2) && validToken(item.IV, 16, 24) && validToken(item.KeyID, 43, 64) && validToken(item.Ciphertext, 20, int(maxItemBytes*2)) && item.Content == "" && item.Alias == ""
+	default:
+		return false
+	}
 }
 
 func hashWriteToken(token string) (string, bool) {
@@ -853,6 +1034,95 @@ func inlineMIMEType(value string) bool {
 	default:
 		return false
 	}
+}
+
+func serveIcon(w http.ResponseWriter, size int) {
+	pixels := make([]byte, size*size*4)
+	set := func(x, y int, color [4]byte) {
+		if x < 0 || x >= size || y < 0 || y >= size {
+			return
+		}
+		offset := (y*size + x) * 4
+		copy(pixels[offset:offset+4], color[:])
+	}
+	green, white := [4]byte{23, 107, 91, 255}, [4]byte{255, 255, 255, 255}
+	for y := 0; y < size; y++ {
+		for x := 0; x < size; x++ {
+			set(x, y, green)
+		}
+	}
+	drawArrow := func(y int, right bool) {
+		thickness, start, end := size/11, size/5, size*4/5
+		for py := y - thickness/2; py <= y+thickness/2; py++ {
+			for px := start; px <= end; px++ {
+				set(px, py, white)
+			}
+		}
+		tip := end
+		if !right {
+			tip = start
+		}
+		for delta := 0; delta < size/7; delta++ {
+			for width := 0; width <= delta; width++ {
+				x := tip - delta
+				if !right {
+					x = tip + delta
+				}
+				set(x, y-width, white)
+				set(x, y+width, white)
+			}
+		}
+	}
+	drawArrow(size*2/5, true)
+	drawArrow(size*3/5, false)
+	w.Header().Set("Content-Type", "image/png")
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	_ = encodePNG(w, size, pixels)
+}
+
+func encodePNG(w io.Writer, size int, pixels []byte) error {
+	var raw, compressed bytes.Buffer
+	for y := 0; y < size; y++ {
+		raw.WriteByte(0) // PNG filter: none.
+		raw.Write(pixels[y*size*4 : (y+1)*size*4])
+	}
+	zipper := zlib.NewWriter(&compressed)
+	if _, err := io.Copy(zipper, &raw); err != nil {
+		return err
+	}
+	if err := zipper.Close(); err != nil {
+		return err
+	}
+	if _, err := w.Write([]byte("\x89PNG\r\n\x1a\n")); err != nil {
+		return err
+	}
+	ihdr := make([]byte, 13)
+	binary.BigEndian.PutUint32(ihdr[0:4], uint32(size))
+	binary.BigEndian.PutUint32(ihdr[4:8], uint32(size))
+	ihdr[8], ihdr[9] = 8, 6 // 8-bit RGBA.
+	if err := writePNGChunk(w, "IHDR", ihdr); err != nil {
+		return err
+	}
+	if err := writePNGChunk(w, "IDAT", compressed.Bytes()); err != nil {
+		return err
+	}
+	return writePNGChunk(w, "IEND", nil)
+}
+
+func writePNGChunk(w io.Writer, name string, data []byte) error {
+	var length [4]byte
+	binary.BigEndian.PutUint32(length[:], uint32(len(data)))
+	if _, err := w.Write(length[:]); err != nil {
+		return err
+	}
+	chunk := append([]byte(name), data...)
+	if _, err := w.Write(chunk); err != nil {
+		return err
+	}
+	var checksum [4]byte
+	binary.BigEndian.PutUint32(checksum[:], crc32.ChecksumIEEE(chunk))
+	_, err := w.Write(checksum[:])
+	return err
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

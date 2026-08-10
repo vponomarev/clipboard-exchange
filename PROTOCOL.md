@@ -1,7 +1,35 @@
-# Clipboard Exchange protocol v4
+# Clipboard Exchange protocol v5
 
 `GET /api/capabilities` — источник negotiated limits и поддержанных версий.
 Клиент не должен считать настроечные значения сервера равными defaults.
+
+## Atomic entries v5
+
+Protocol v5 публикует группу «необязательный текст + N файлов» только целиком:
+
+```text
+POST   /api/rooms/{room}/entries
+POST   /api/rooms/{room}/entries/{entry}/commit
+PUT    /api/rooms/{room}/entries/{entry}/pin
+DELETE /api/rooms/{room}/entries/{entry}
+POST   /api/rooms/{room}/clear
+```
+
+Первый запрос создаёт невидимый draft и принимает `id`, `expectedFiles`,
+необязательный `item`, `expiresInSeconds` и `deleteAfterDownload`. Каждый upload
+ссылается на этот `entryId` и уникальный `entryIndex`. `commit` успешен, только
+если завершено ровно `expectedFiles` и активных uploads группы не осталось.
+До commit draft, его текст и завершённые файлы не возвращаются читателям и не
+создают room event. Legacy v4-записи без строки в `entries` остаются видимыми.
+
+TTL записи хранится как абсолютное серверное время. Download-once разрешён только
+для записи без текста с одним файлом и является best-effort, а не DRM. Полный
+download без Range удаляет запись; encrypted client подтверждает завершение через
+`POST /api/rooms/{room}/files/{file}/consume`.
+
+При создании комнаты `ttlSeconds` переопределяет глобальный inactivity TTL.
+Нулевое значение наследует глобальную настройку. `GET /metrics` содержит только
+агрегаты и не является частью пользовательских данных комнаты.
 
 ## Capability tokens
 

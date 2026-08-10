@@ -19,6 +19,8 @@ type Store struct {
 	root string
 }
 
+func (s *Store) Root() string { return s.root }
+
 func Open(root string) (*Store, error) {
 	abs, err := filepath.Abs(root)
 	if err != nil {

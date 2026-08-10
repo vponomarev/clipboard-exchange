@@ -253,7 +253,7 @@ func TestCapabilitiesAndAliasLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
-	if capabilities["protocolVersion"] != float64(4) || capabilities["writeCapabilities"] != true || capabilities["openWriteRooms"] != true || capabilities["groupedAttachments"] != true || capabilities["inlineFiles"] != true || capabilities["aliases"] != true {
+	if capabilities["protocolVersion"] != float64(5) || capabilities["writeCapabilities"] != true || capabilities["openWriteRooms"] != true || capabilities["groupedAttachments"] != true || capabilities["inlineFiles"] != true || capabilities["aliases"] != true || capabilities["atomicEntries"] != true || capabilities["entryTTL"] != true || capabilities["roomTTL"] != true || capabilities["pwa"] != true {
 		t.Fatalf("unexpected capabilities: %#v", capabilities)
 	}
 
@@ -276,6 +276,149 @@ func TestInlineMIMETypeRejectsActiveContent(t *testing.T) {
 		if inlineMIMEType(value) {
 			t.Errorf("active or unsupported preview type accepted: %s", value)
 		}
+	}
+}
+
+func TestAtomicTextEntryPinClearMetricsAndPWA(t *testing.T) {
+	ts := testServer(t)
+	client := ts.Client()
+	resp := requestJSON(t, client, http.MethodPost, ts.URL+"/api/rooms", map[string]any{"id": "atomic-api", "writeProtected": false, "ttlSeconds": 3600})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create room: %s", resp.Status)
+	}
+	resp.Body.Close()
+	entryID := "123e4567-e89b-12d3-a456-426614174030"
+	resp = requestJSON(t, client, http.MethodPost, ts.URL+"/api/rooms/atomic-api/entries", map[string]any{"id": entryID, "expectedFiles": 0, "expiresInSeconds": 60, "item": map[string]any{"kind": "text", "content": "exact\ntext", "alias": "Вася"}})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create draft: %s", resp.Status)
+	}
+	resp.Body.Close()
+	getRoom := func() roomResponse {
+		response, err := client.Get(ts.URL + "/api/rooms/atomic-api")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer response.Body.Close()
+		var room roomResponse
+		if err := json.NewDecoder(response.Body).Decode(&room); err != nil {
+			t.Fatal(err)
+		}
+		return room
+	}
+	if room := getRoom(); len(room.Items) != 0 || len(room.Entries) != 0 {
+		t.Fatalf("draft leaked through room API: %#v", room)
+	}
+	resp = requestJSON(t, client, http.MethodPost, ts.URL+"/api/rooms/atomic-api/entries/"+entryID+"/commit", nil)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("commit: %s", resp.Status)
+	}
+	resp.Body.Close()
+	if room := getRoom(); len(room.Items) != 1 || len(room.Entries) != 1 || room.Room.TTLSeconds != 3600 {
+		t.Fatalf("committed room response: %#v", room)
+	}
+	resp = requestJSON(t, client, http.MethodPut, ts.URL+"/api/rooms/atomic-api/entries/"+entryID+"/pin", map[string]bool{"pinned": true})
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("pin: %s", resp.Status)
+	}
+	resp.Body.Close()
+	if room := getRoom(); len(room.Entries) != 1 || !room.Entries[0].Pinned {
+		t.Fatalf("pin not returned: %#v", room.Entries)
+	}
+	resp, err := client.Get(ts.URL + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	metrics, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || !bytes.Contains(metrics, []byte("clipboard_exchange_rooms 1")) || bytes.Contains(metrics, []byte("exact")) {
+		t.Fatalf("unsafe or incomplete metrics: %s", metrics)
+	}
+	for _, asset := range []string{"/assets/manifest.webmanifest?v=1", "/assets/download-sw.js?v=7", "/assets/icon-192.png", "/assets/icon-512.png"} {
+		response, err := client.Get(ts.URL + asset)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(response.Body)
+		response.Body.Close()
+		if response.StatusCode != http.StatusOK || len(body) < 8 {
+			t.Fatalf("PWA asset %s: status=%s bytes=%d", asset, response.Status, len(body))
+		}
+		if strings.Contains(asset, ".png") && !bytes.Equal(body[:8], []byte("\x89PNG\r\n\x1a\n")) {
+			t.Fatalf("invalid PNG signature for %s", asset)
+		}
+	}
+	resp = requestJSON(t, client, http.MethodPost, ts.URL+"/api/rooms/atomic-api/clear", nil)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("clear: %s", resp.Status)
+	}
+	resp.Body.Close()
+	if room := getRoom(); len(room.Items)+len(room.Files)+len(room.Entries) != 0 {
+		t.Fatalf("room was not cleared: %#v", room)
+	}
+}
+
+func TestDownloadOnceDeletesOnlyAfterFullResponse(t *testing.T) {
+	ts := testServer(t)
+	client := ts.Client()
+	resp := requestJSON(t, client, http.MethodPost, ts.URL+"/api/rooms", map[string]any{"id": "download-once", "writeProtected": false})
+	resp.Body.Close()
+	entryID := "123e4567-e89b-12d3-a456-426614174040"
+	resp = requestJSON(t, client, http.MethodPost, ts.URL+"/api/rooms/download-once/entries", map[string]any{"id": entryID, "expectedFiles": 1, "deleteAfterDownload": true})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create entry: %s", resp.Status)
+	}
+	resp.Body.Close()
+	resp = requestJSON(t, client, http.MethodPost, ts.URL+"/api/rooms/download-once/uploads", map[string]any{"entryId": entryID, "entryIndex": 0, "name": "once.txt", "mimeType": "text/plain", "size": 4})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create upload: %s", resp.Status)
+	}
+	var upload struct {
+		ID          string `json:"id"`
+		FileID      string `json:"fileId"`
+		UploadToken string `json:"uploadToken"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&upload); err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	resp = requestUpload(t, client, http.MethodPut, ts.URL+"/api/rooms/download-once/uploads/"+upload.ID+"/chunks/0", strings.NewReader("once"), upload.UploadToken)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("put chunk: %s", resp.Status)
+	}
+	resp.Body.Close()
+	resp = requestUpload(t, client, http.MethodPost, ts.URL+"/api/rooms/download-once/uploads/"+upload.ID+"/complete", nil, upload.UploadToken)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("complete upload: %s", resp.Status)
+	}
+	resp.Body.Close()
+	resp = requestJSON(t, client, http.MethodPost, ts.URL+"/api/rooms/download-once/entries/"+entryID+"/commit", nil)
+	resp.Body.Close()
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/rooms/download-once/files/"+upload.FileID, nil)
+	req.Header.Set("Range", "bytes=0-0")
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusPartialContent {
+		t.Fatalf("range: %s", resp.Status)
+	}
+	resp, err = client.Get(ts.URL + "/api/rooms/download-once/files/" + upload.FileID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || string(body) != "once" {
+		t.Fatalf("full download: status=%s body=%q", resp.Status, body)
+	}
+	resp, err = client.Get(ts.URL + "/api/rooms/download-once/files/" + upload.FileID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("download-once file remains: %s", resp.Status)
 	}
 }
 
@@ -500,14 +643,14 @@ func TestServesEmbeddedApplication(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Contains(body, []byte(`/assets/app.js?v=8`)) {
+	if !bytes.Contains(body, []byte(`/assets/app.js?v=13`)) {
 		t.Fatal("page does not cache-bust app.js")
 	}
-	if !bytes.Contains(body, []byte(`/assets/style.css?v=8`)) {
+	if !bytes.Contains(body, []byte(`/assets/style.css?v=10`)) {
 		t.Fatal("page does not cache-bust style.css")
 	}
 
-	resp, err = ts.Client().Get(ts.URL + "/assets/app.js?v=8")
+	resp, err = ts.Client().Get(ts.URL + "/assets/app.js?v=13")
 	if err != nil {
 		t.Fatal(err)
 	}
