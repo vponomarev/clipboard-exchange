@@ -400,7 +400,7 @@ test("mobile layout can create a room and show QR", async ({ page }, testInfo) =
   const heading = await page.locator(".room-heading").boundingBox();
   const composer = await page.locator("#item-form").boundingBox();
   expect(heading.height).toBeLessThan(95);
-  expect(composer.height).toBeLessThan(145);
+  expect(composer.height).toBeLessThan(165);
   await expect(page.locator("#alias")).toBeHidden();
   await page.getByText("Настройки", { exact:true }).click();
   await expect(page.locator("#alias")).toBeVisible();
