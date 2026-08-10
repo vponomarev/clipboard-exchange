@@ -5,10 +5,14 @@
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <meta name="color-scheme" content="light dark">
   <meta name="theme-color" content="#111827">
+  <meta name="application-name" content="Clipboard Exchange">
+  <meta name="apple-mobile-web-app-capable" content="yes">
   <title>Clipboard Exchange</title>
-  <link rel="stylesheet" href="/assets/style.css?v=8">
+  <link rel="manifest" href="/assets/manifest.webmanifest?v=1">
+  <link rel="icon" href="/assets/icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/assets/style.css?v=10">
   <script defer src="/assets/qrcode.min.js"></script>
-  <script defer src="/assets/app.js?v=8"></script>
+  <script defer src="/assets/app.js?v=13"></script>
 </head>
 <body>
   <header class="topbar">
@@ -16,7 +20,10 @@
       <span class="brand-mark" aria-hidden="true">⇄</span>
       <span>Clipboard Exchange</span>
     </a>
-    <span id="connection" class="connection hidden" role="status"></span>
+    <div class="top-actions">
+      <button id="install-app" class="button secondary compact hidden" type="button">Установить</button>
+      <span id="connection" class="connection hidden" role="status"></span>
+    </div>
   </header>
 
   <main>
@@ -38,6 +45,16 @@
           <span><strong>Разделить права R/O и R/W</strong><small>Для записи потребуется секретная R/W-ссылка. Без этой опции любой участник комнаты может добавлять и удалять.</small></span>
         </label>
 
+        <label for="room-ttl">Срок неактивности комнаты</label>
+        <select id="room-ttl">
+          <option value="0">Настройка сервера</option>
+          <option value="3600">1 час</option>
+          <option value="86400">1 день</option>
+          <option value="604800">1 неделя</option>
+          <option value="2592000">30 дней</option>
+          <option value="31536000">1 год</option>
+        </select>
+
         <label class="check-row">
           <input id="encrypted" type="checkbox">
           <span><strong>Шифровать в браузере</strong><small>Сервер будет видеть только зашифрованные данные и метаданные.</small></span>
@@ -55,6 +72,11 @@
         <p id="create-error" class="error hidden" role="alert"></p>
         <button class="button primary wide" type="submit">Создать комнату</button>
       </form>
+
+      <section id="recent-section" class="recent-section hidden">
+        <div class="list-heading"><h2>Недавние комнаты</h2><button id="forget-all-rooms" class="button secondary compact" type="button">Очистить историю</button></div>
+        <div id="recent-rooms" class="recent-rooms"></div>
+      </section>
     </section>
 
     <section id="room" class="room hidden">
@@ -64,6 +86,7 @@
           <h1 id="room-name"></h1>
         </div>
         <div class="room-actions">
+          <button id="favorite-room" class="button secondary" type="button">☆ В избранное</button>
           <button id="share" class="button secondary" type="button">Поделиться</button>
           <a class="button secondary" href="/">Новая комната</a>
         </div>
@@ -80,6 +103,19 @@
         </div>
         <label class="sr-only" for="item-text">Текст для обмена</label>
         <textarea id="item-text" maxlength="65536" placeholder="Текст необязателен, если выбраны файлы…" rows="5"></textarea>
+        <div class="composer-tools">
+          <button id="read-clipboard" class="button secondary compact" type="button">Вставить из буфера</button>
+          <label>Срок записи
+            <select id="entry-ttl">
+              <option value="0">Без ограничения</option>
+              <option value="300">5 минут</option>
+              <option value="3600">1 час</option>
+              <option value="86400">1 день</option>
+              <option value="604800">1 неделя</option>
+            </select>
+          </label>
+          <label class="inline-check"><input id="delete-after-download" type="checkbox"> удалить после скачивания</label>
+        </div>
         <div id="file-drop" class="file-drop">
           <input id="file-input" type="file" multiple>
           <label for="file-input" class="button secondary">Добавить файлы</label>
@@ -95,6 +131,23 @@
       <div class="list-heading">
         <h2>Записи</h2>
         <span id="item-count" class="muted"></span>
+      </div>
+      <div class="timeline-tools">
+        <input id="search" type="search" placeholder="Поиск по тексту, alias и именам файлов" aria-label="Поиск">
+        <select id="type-filter" aria-label="Тип записей">
+          <option value="all">Все типы</option>
+          <option value="text">Текст</option>
+          <option value="files">Файлы</option>
+          <option value="images">Изображения</option>
+          <option value="documents">Документы</option>
+        </select>
+        <button id="new-items" class="button primary compact hidden" type="button"></button>
+      </div>
+      <div class="room-preferences">
+        <label class="inline-check"><input id="remember-room" type="checkbox"> запомнить ключ и R/W-доступ на этом устройстве</label>
+        <label class="inline-check"><input id="notifications" type="checkbox"> уведомления</label>
+        <label class="inline-check"><input id="notification-sound" type="checkbox"> звук</label>
+        <button id="clear-room" class="button secondary compact delete hidden" type="button">Очистить комнату</button>
       </div>
       <div id="empty" class="empty hidden">Пока пусто. Добавьте первую запись или файл.</div>
       <div id="items" class="items" aria-live="polite"></div>
@@ -138,6 +191,19 @@
       </div>
       <p id="share-note" class="hint"></p>
       <button id="rotate-write" class="button secondary hidden" type="button">Отозвать старые R/W-ссылки</button>
+    </div>
+  </dialog>
+
+  <dialog id="preview-dialog" class="preview-dialog">
+    <div class="dialog-card preview-card">
+      <button class="dialog-close icon-button" type="button" aria-label="Закрыть">×</button>
+      <h2 id="preview-title">Просмотр</h2>
+      <div id="preview-content" class="preview-content"></div>
+      <div class="dialog-actions">
+        <button id="preview-prev" class="button secondary" type="button">←</button>
+        <button id="preview-next" class="button secondary" type="button">→</button>
+        <a id="preview-download" class="button primary" download>Скачать</a>
+      </div>
     </div>
   </dialog>
 

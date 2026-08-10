@@ -4,7 +4,7 @@
   const $ = (id) => document.getElementById(id);
   const roomMatch = location.pathname.match(/^\/r\/([A-Za-z0-9][A-Za-z0-9_-]{0,63})$/);
   const fragment = new URLSearchParams(location.hash.slice(1));
-  const state = { roomID: roomMatch ? roomMatch[1] : "", room: null, key: null, keyText: "", writeToken: fragment.get("write") || "", canWrite: Boolean(fragment.get("write")), items: [], files: [], pendingFiles: [], capabilities: null, downloadRegistration: null, socket: null, refreshTimer: 0 };
+  const state = { roomID: roomMatch ? roomMatch[1] : "", room: null, key: null, keyText: "", writeToken: fragment.get("write") || "", canWrite: Boolean(fragment.get("write")), entries: [], items: [], files: [], renderedEntries: [], pendingFiles: [], capabilities: null, downloadRegistration: null, socket: null, refreshTimer: 0, previousEntryIDs: new Set(), hasRefreshed: false, unread: 0, previewIndex: 0, installPrompt: null };
   const encoder = new TextEncoder();
   const decoder = new TextDecoder("utf-8", { fatal: true });
 
@@ -64,7 +64,7 @@
     const response = await fetch(url, { ...fetchOptions, headers });
     if (response.status === 204) return null;
     const data = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(data.error?.message || `Ошибка HTTP ${response.status}`);
+    if (!response.ok) { const error = new Error(data.error?.message || `Ошибка HTTP ${response.status}`); error.status = response.status; throw error; }
     return data;
   }
 
@@ -80,6 +80,52 @@
   function newWriteToken() { return "cw1_" + b64url(crypto.getRandomValues(new Uint8Array(32))); }
   function loadAlias() { try { return localStorage.getItem("clipboard-exchange:alias") || ""; } catch (_) { return ""; } }
   function saveAlias(value) { try { localStorage.setItem("clipboard-exchange:alias", value); } catch (_) {} }
+  function loadRecentRooms() { try { return JSON.parse(localStorage.getItem("clipboard-exchange:rooms") || "[]"); } catch (_) { return []; } }
+  function saveRecentRooms(rooms) { try { localStorage.setItem("clipboard-exchange:rooms", JSON.stringify(rooms.slice(0, 50))); } catch (_) {} }
+  function updateRecentRoom(changes = {}) {
+    if (!state.roomID) return;
+    const rooms = loadRecentRooms(); const current = rooms.find(room => room.id === state.roomID) || { id:state.roomID, name:state.roomID, favorite:false };
+    Object.assign(current, { encrypted:Boolean(state.room?.encrypted), lastVisited:Date.now() }, changes);
+    saveRecentRooms([current, ...rooms.filter(room => room.id !== state.roomID)].sort((a,b) => Number(b.favorite)-Number(a.favorite) || b.lastVisited-a.lastVisited));
+  }
+  function openPwaDB() {
+    return new Promise((resolve, reject) => {
+      const request = indexedDB.open("clipboard-exchange-pwa", 2);
+      request.onupgradeneeded = () => { if (!request.result.objectStoreNames.contains("shared")) request.result.createObjectStore("shared", { keyPath:"id" }); if (!request.result.objectStoreNames.contains("vault")) request.result.createObjectStore("vault", { keyPath:"id" }); };
+      request.onerror = () => reject(request.error); request.onsuccess = () => resolve(request.result);
+    });
+  }
+  async function idbOperation(storeName, mode, operation) {
+    const db = await openPwaDB();
+    return new Promise((resolve, reject) => { const tx = db.transaction(storeName, mode); const request = operation(tx.objectStore(storeName)); request.onsuccess = () => resolve(request.result); request.onerror = () => reject(request.error); tx.oncomplete = () => db.close(); });
+  }
+  const idbGet = (store, id) => idbOperation(store, "readonly", objectStore => objectStore.get(id));
+  const idbPut = (store, value) => idbOperation(store, "readwrite", objectStore => objectStore.put(value));
+  const idbDelete = (store, id) => idbOperation(store, "readwrite", objectStore => objectStore.delete(id));
+  async function vaultKey() {
+    let record = await idbGet("vault", "device-key");
+    if (record?.key) return record.key;
+    const key = await crypto.subtle.generateKey({ name:"AES-GCM", length:256 }, false, ["encrypt", "decrypt"]);
+    await idbPut("vault", { id:"device-key", key }); return key;
+  }
+  async function rememberSecrets() {
+    if (!crypto?.subtle) throw new Error("Безопасное запоминание ключа требует HTTPS или localhost");
+    const key = await vaultKey(); const iv = crypto.getRandomValues(new Uint8Array(12));
+    const plaintext = encoder.encode(JSON.stringify({ keyText:state.keyText, writeToken:state.writeToken }));
+    const ciphertext = await crypto.subtle.encrypt({ name:"AES-GCM", iv, additionalData:encoder.encode(state.roomID) }, key, plaintext);
+    await idbPut("vault", { id:`room:${state.roomID}`, iv:b64url(iv), ciphertext:b64url(new Uint8Array(ciphertext)) });
+  }
+  async function loadRememberedSecrets() {
+    const record = await idbGet("vault", `room:${state.roomID}`).catch(() => null);
+    if (!record || !crypto?.subtle) return false;
+    try {
+      const plaintext = await crypto.subtle.decrypt({ name:"AES-GCM", iv:fromB64url(record.iv), additionalData:encoder.encode(state.roomID) }, await vaultKey(), fromB64url(record.ciphertext));
+      const value = JSON.parse(decoder.decode(plaintext));
+      if (!state.writeToken && typeof value.writeToken === "string") state.writeToken = value.writeToken;
+      if (!fragment.get("key") && typeof value.keyText === "string" && value.keyText) state.keyText = value.keyText;
+      return true;
+    } catch (_) { await idbDelete("vault", `room:${state.roomID}`).catch(() => {}); return false; }
+  }
   function show(id, visible = true) { $(id).classList.toggle("hidden", !visible); }
   function message(id, text) { $(id).textContent = text; show(id, Boolean(text)); }
   function toast(text) {
@@ -98,6 +144,34 @@
     button.setAttribute("aria-label", input.type === "password" ? "Показать ключ" : "Скрыть ключ");
   }
 
+  async function initPWA() {
+    if (navigator.serviceWorker) navigator.serviceWorker.register("/assets/download-sw.js?v=7", { scope:"/" }).catch(() => {});
+    addEventListener("beforeinstallprompt", event => { event.preventDefault(); state.installPrompt = event; show("install-app"); });
+    $("install-app").addEventListener("click", async () => { if (!state.installPrompt) return; await state.installPrompt.prompt(); state.installPrompt = null; show("install-app", false); });
+  }
+
+  function renderRecentRooms() {
+    const rooms = loadRecentRooms(); const container = $("recent-rooms"); container.replaceChildren(); show("recent-section", rooms.length > 0);
+    for (const room of rooms) {
+      const row = document.createElement("div"); row.className = "recent-room";
+      const link = document.createElement("a"); link.href = `/r/${encodeURIComponent(room.id)}`;
+      const title = document.createElement("strong"); title.textContent = `${room.favorite ? "★ " : ""}${room.name || room.id}`;
+      const details = document.createElement("small"); details.textContent = `${room.id}${room.encrypted ? " · зашифрована" : ""}`; link.append(title, details);
+      const actions = document.createElement("div"); actions.className = "item-buttons";
+      for (const [label, action] of [[room.favorite ? "Убрать ★" : "★", "favorite"], ["Название", "rename"], ["Забыть", "forget"]]) { const button=document.createElement("button"); button.type="button"; button.className="button secondary compact"; button.textContent=label; button.dataset.action=action; button.dataset.room=room.id; actions.append(button); }
+      row.append(link, actions); container.append(row);
+    }
+  }
+
+  async function recentRoomAction(event) {
+    const button = event.target.closest("button[data-room]"); if (!button) return;
+    let rooms = loadRecentRooms(); const room = rooms.find(value => value.id === button.dataset.room); if (!room) return;
+    if (button.dataset.action === "favorite") room.favorite = !room.favorite;
+    if (button.dataset.action === "rename") { const name = prompt("Локальное название комнаты", room.name || room.id); if (name !== null) room.name = name.trim().slice(0, 80) || room.id; }
+    if (button.dataset.action === "forget") { rooms = rooms.filter(value => value.id !== room.id); await idbDelete("vault", `room:${room.id}`).catch(() => {}); }
+    saveRecentRooms(rooms.sort((a,b) => Number(b.favorite)-Number(a.favorite) || b.lastVisited-a.lastVisited)); renderRecentRooms();
+  }
+
   function initHome() {
     show("home");
     const requestedRoom = new URLSearchParams(location.search).get("room");
@@ -106,6 +180,9 @@
     $("encrypted").addEventListener("change", () => show("encryption-options", $("encrypted").checked));
     $("toggle-create-key").addEventListener("click", (e) => togglePassword("room-key", e.currentTarget));
     $("create-form").addEventListener("submit", createRoom);
+	$("recent-rooms").addEventListener("click", recentRoomAction);
+	$("forget-all-rooms").addEventListener("click", async () => { if (!confirm("Удалить локальную историю комнат и сохранённые ключи?")) return; for (const room of loadRecentRooms()) await idbDelete("vault", `room:${room.id}`).catch(() => {}); saveRecentRooms([]); renderRecentRooms(); });
+	renderRecentRooms();
   }
 
   async function createRoom(event) {
@@ -123,7 +200,8 @@
         keyId = await keyID(raw); keyText = rawKeyText(raw);
       }
       const writeToken = writeProtected ? newWriteToken() : "";
-      await api("/api/rooms", { method: "POST", body: JSON.stringify({ id: state.roomID, encrypted, keyId, writeProtected, writeToken }) });
+	  const ttlSeconds = Number($("room-ttl").value);
+      await api("/api/rooms", { method: "POST", body: JSON.stringify({ id: state.roomID, encrypted, keyId, writeProtected, writeToken, ttlSeconds }) });
       const nextFragment = new URLSearchParams();
       if (writeProtected) nextFragment.set("write", writeToken);
       if (encrypted) nextFragment.set("key", keyText);
@@ -134,6 +212,9 @@
 
   async function initRoom() {
     show("room"); $("room-name").textContent = state.roomID;
+	$("alias").value = loadAlias();
+	const remembered = await loadRememberedSecrets();
+	$("remember-room").checked = remembered;
     $("file-input").disabled = true;
     $("share").addEventListener("click", openShare);
     $("item-form").addEventListener("submit", addItem);
@@ -144,7 +225,21 @@
     $("share-dialog").querySelector(".dialog-close").addEventListener("click", () => $("share-dialog").close());
     document.querySelectorAll('input[name="share-permission"], input[name="share-key"]').forEach((el) => el.addEventListener("change", updateShare));
     $("rotate-write").addEventListener("click", rotateWriteCapability);
-    $("alias").value = loadAlias();
+	$("favorite-room").addEventListener("click", () => { const room=loadRecentRooms().find(value => value.id===state.roomID); updateRecentRoom({ favorite:!room?.favorite }); updateFavoriteButton(); });
+	$("remember-room").addEventListener("change", async () => { try { if ($("remember-room").checked) await rememberSecrets(); else await idbDelete("vault", `room:${state.roomID}`); toast($("remember-room").checked ? "Доступ сохранён на этом устройстве" : "Сохранённый доступ удалён"); } catch (error) { $("remember-room").checked=false; message("room-error", error.message); } });
+	$("read-clipboard").addEventListener("click", readClipboard);
+	$("item-text").addEventListener("paste", pasteClipboardFiles);
+	$("search").addEventListener("input", renderItems);
+	$("type-filter").addEventListener("change", renderItems);
+	$("new-items").addEventListener("click", () => { state.unread=0; updateUnread(); $("items").scrollIntoView({ behavior:"smooth" }); });
+	$("notifications").checked = localStorage.getItem(`clipboard-exchange:notify:${state.roomID}`) === "1";
+	$("notification-sound").checked = localStorage.getItem(`clipboard-exchange:sound:${state.roomID}`) === "1";
+	$("notifications").addEventListener("change", configureNotifications);
+	$("notification-sound").addEventListener("change", () => localStorage.setItem(`clipboard-exchange:sound:${state.roomID}`, $("notification-sound").checked ? "1" : "0"));
+	$("clear-room").addEventListener("click", clearCurrentRoom);
+	$("preview-dialog").querySelector(".dialog-close").addEventListener("click", () => closePreview());
+	$("preview-prev").addEventListener("click", () => showPreview(state.previewIndex-1));
+	$("preview-next").addEventListener("click", () => showPreview(state.previewIndex+1));
     $("alias").addEventListener("input", () => saveAlias($("alias").value));
     $("file-input").addEventListener("change", (event) => queueFiles(event.target.files));
     for (const type of ["dragenter", "dragover"]) $("file-drop").addEventListener(type, (event) => { event.preventDefault(); $("file-drop").classList.add("dragging"); });
@@ -159,15 +254,21 @@
       }
       else { $("encryption-state").textContent = "Без шифрования"; renderItems(); }
       connect();
+	  await consumeSharedPayload();
     } catch (error) { message("room-error", error.message); $("item-text").disabled = true; $("send").disabled = true; }
   }
 
   async function refresh() {
     const data = await api(`/api/rooms/${encodeURIComponent(state.roomID)}`);
-    state.room = data.room; state.items = data.items; state.files = data.files || [];
+	const nextIDs = new Set([...(data.entries || []).map(entry => entry.id), ...data.items.map(item => item.id), ...(data.files || []).map(file => file.entryId || file.id)]);
+	const added = [...nextIDs].filter(id => !state.previousEntryIDs.has(id));
+    state.room = data.room; state.entries = data.entries || []; state.items = data.items; state.files = data.files || [];
+	state.previousEntryIDs = nextIDs;
     updateAccessState();
-    $("item-count").textContent = `${state.items.length} записей · ${state.files.length} файлов`;
+	updateRecentRoom(); updateFavoriteButton();
     if (!state.room.encrypted || state.key) await renderItems();
+	if (state.hasRefreshed && added.length && document.hidden) { state.unread += added.length; updateUnread(); notifyNewEntries(added.length); }
+	state.hasRefreshed = true;
   }
 
   function updateAccessState() {
@@ -176,7 +277,64 @@
     show("item-form", state.canWrite);
     show("access-notice", !state.canWrite);
     show("file-drop", state.canWrite);
+	show("clear-room", state.canWrite);
     $("file-input").disabled = !state.canWrite || (state.room.encrypted && !state.key);
+  }
+
+  function updateFavoriteButton() {
+	const favorite = Boolean(loadRecentRooms().find(room => room.id === state.roomID)?.favorite);
+	$("favorite-room").textContent = favorite ? "★ В избранном" : "☆ В избранное";
+  }
+
+  async function readClipboard() {
+	try {
+	  if (navigator.clipboard?.read) {
+		const files=[]; const texts=[];
+		for (const item of await navigator.clipboard.read()) for (const type of item.types) {
+		  const blob = await item.getType(type);
+		  if (type === "text/plain") texts.push(await blob.text());
+		  else { const extension=(type.split("/")[1] || "bin").replace(/[^a-z0-9]+/gi,"-"); files.push(new File([blob], `clipboard-${Date.now()}.${extension}`, { type })); }
+		}
+		if (texts.length) $("item-text").value += ($("item-text").value ? "\n" : "") + texts.join("\n");
+		if (files.length) queueFiles(files);
+	  } else if (navigator.clipboard?.readText) $("item-text").value += await navigator.clipboard.readText();
+	  else throw new Error("Браузер не поддерживает чтение буфера обмена");
+	} catch (error) { message("room-error", `Буфер обмена недоступен: ${error.message}`); }
+  }
+
+  function pasteClipboardFiles(event) {
+	const files = Array.from(event.clipboardData?.files || []); if (files.length) queueFiles(files);
+  }
+
+  async function consumeSharedPayload() {
+	const shared = await idbGet("shared", "pending").catch(() => null); if (!shared) return;
+	const text = [shared.title, shared.text, shared.url].filter(Boolean).join("\n");
+	if (text) $("item-text").value = text;
+	if (shared.files?.length) queueFiles(shared.files);
+	await idbDelete("shared", "pending").catch(() => {});
+	toast("Данные из системного меню «Поделиться» добавлены в черновик");
+  }
+
+  async function configureNotifications() {
+	if ($("notifications").checked) {
+	  if (!("Notification" in window)) { $("notifications").checked=false; message("room-error", "Браузер не поддерживает уведомления"); return; }
+	  const permission = await Notification.requestPermission();
+	  if (permission !== "granted") { $("notifications").checked=false; message("room-error", "Разрешение на уведомления не выдано"); }
+	}
+	localStorage.setItem(`clipboard-exchange:notify:${state.roomID}`, $("notifications").checked ? "1" : "0");
+  }
+
+  function notifyNewEntries(count) {
+	if ($("notifications").checked && Notification.permission === "granted") new Notification("Clipboard Exchange", { body:`Новых сообщений: ${count}`, icon:"/assets/icon.svg", tag:`room-${state.roomID}` });
+	if ($("notification-sound").checked) { try { const context=new AudioContext(); const oscillator=context.createOscillator(); const gain=context.createGain(); gain.gain.value=.035; oscillator.frequency.value=660; oscillator.connect(gain).connect(context.destination); oscillator.start(); oscillator.stop(context.currentTime+.12); oscillator.onended=()=>context.close(); } catch (_) {} }
+  }
+
+  function updateUnread() { $("new-items").textContent = `${state.unread} новых`; show("new-items", state.unread > 0); }
+
+  async function clearCurrentRoom() {
+	if (!confirm("Удалить все сообщения и незавершённые загрузки комнаты?")) return;
+	try { await api(`/api/rooms/${encodeURIComponent(state.roomID)}/clear`, { method:"POST", write:true }); state.pendingFiles.forEach(entry => entry.row.remove()); state.pendingFiles=[]; await refresh(); }
+	catch (error) { message("room-error", error.message); }
   }
 
   async function prepareKey() {
@@ -184,7 +342,7 @@
       message("crypto-warning", "Эта комната зашифрована. Откройте её по HTTPS или через localhost: Web Crypto недоступен в обычном HTTP-подключении.");
       $("item-text").disabled = true; $("send").disabled = true; return;
     }
-    const supplied = fragment.get("key");
+    const supplied = fragment.get("key") || state.keyText;
     if (supplied) {
       try { await unlock(supplied); return; } catch (_) { /* ask explicitly */ }
     }
@@ -199,6 +357,7 @@
     $("encryption-state").textContent = "Сквозное шифрование включено";
     message("crypto-warning", "");
     await renderItems();
+	if ($("remember-room").checked) await rememberSecrets().catch(() => {});
   }
 
   async function unlockFromDialog(event) {
@@ -264,26 +423,39 @@
     if (!text && pending.length === 0) return;
     const alias = $("alias").value;
     if (Array.from(alias).length > 64) { message("room-error", "Alias не может быть длиннее 64 символов"); return; }
+	const deleteAfterDownload = $("delete-after-download").checked;
+	if (deleteAfterDownload && (text || pending.length !== 1)) { message("room-error", "Удаление после скачивания доступно только для сообщения из одного файла без текста"); return; }
     $("send").disabled = true;
     try {
-      const resumed = pending.map((entry) => loadUploadSession(entry.file)?.entryId).find(Boolean);
-      const entryID = resumed || uuid();
-      if (text) {
-        const payload = state.room.encrypted ? await encrypt(text, alias) : { kind: "text", content: text, alias };
-        payload.id = entryID;
-        await api(`/api/rooms/${encodeURIComponent(state.roomID)}/items`, { method: "POST", body: JSON.stringify(payload), write: true });
-        $("item-text").value = "";
-      }
+      const resumedIDs = [...new Set(pending.map((entry) => loadUploadSession(entry.file)?.entryId).filter(Boolean))];
+	  if (resumedIDs.length > 1) throw new Error("Выбраны файлы из разных незавершённых сообщений; отправьте их отдельно");
+      const entryID = resumedIDs[0] || uuid();
+	  if (resumedIDs.length && text) throw new Error("Текст незавершённого сообщения уже сохранён; очистите поле и продолжите загрузку файлов");
+	  if (!resumedIDs.length) {
+		let item = null;
+		if (text) { item = state.room.encrypted ? await encrypt(text, alias) : { kind:"text", content:text, alias }; item.id = entryID; }
+		await api(`/api/rooms/${encodeURIComponent(state.roomID)}/entries`, { method:"POST", body:JSON.stringify({ id:entryID, expectedFiles:pending.length, expiresInSeconds:Number($("entry-ttl").value), deleteAfterDownload, item }), write:true });
+		if (text) $("item-text").value = "";
+	  }
       state.pendingFiles = state.pendingFiles.filter((entry) => !pending.includes(entry));
+	  const uploads = [];
       for (const [entryIndex, entry] of pending.entries()) {
         entry.started = true;
         entry.control.entryID = entryID;
+		entry.control.group = pending;
         entry.status.textContent = "Подготовка…";
-        runUpload(entry.file, entry.row, entry.progress, entry.status, entry.actions, entry.control, entryID, entryIndex).catch(() => {});
+		uploads.push(runUpload(entry.file, entry.row, entry.progress, entry.status, entry.actions, entry.control, entryID, entryIndex));
       }
+	  await Promise.all(uploads);
+	  await commitEntry(entryID);
+	  $("delete-after-download").checked = false;
       await refresh();
     } catch (error) { message("room-error", error.message); }
     finally { $("send").disabled = false; }
+  }
+
+  async function commitEntry(entryID) {
+	await api(`/api/rooms/${encodeURIComponent(state.roomID)}/entries/${entryID}/commit`, { method:"POST", write:true });
   }
 
   async function renderItems() {
@@ -312,10 +484,16 @@
       if (!entry.alias && metadata.alias) entry.alias = metadata.alias;
       if (new Date(file.createdAt) < new Date(entry.createdAt)) entry.createdAt = file.createdAt;
     }
+	const metadataByID = new Map(state.entries.map(entry => [entry.id, entry]));
+	for (const entry of entries.values()) Object.assign(entry, metadataByID.get(entry.id) || { pinned:false, expiresAt:"", deleteAfterDownload:false });
     for (const entry of entries.values()) entry.files.sort((left, right) => (left.file.entryIndex || 0) - (right.file.entryIndex || 0));
-    const ordered = Array.from(entries.values()).sort((left, right) => new Date(right.createdAt) - new Date(left.createdAt));
+	const query = $("search").value.trim().toLocaleLowerCase(); const filter = $("type-filter").value;
+	const matchesType = entry => filter === "all" || (filter === "text" && Boolean(entry.text)) || (filter === "files" && entry.files.length>0) || (filter === "images" && entry.files.some(value => String(value.metadata.mimeType).startsWith("image/"))) || (filter === "documents" && entry.files.some(value => !String(value.metadata.mimeType).startsWith("image/") && !String(value.metadata.mimeType).startsWith("audio/") && !String(value.metadata.mimeType).startsWith("video/")));
+	const matchesQuery = entry => !query || [entry.text, entry.alias, ...entry.files.map(value => value.metadata.name)].some(value => String(value || "").toLocaleLowerCase().includes(query));
+	const ordered = Array.from(entries.values()).filter(entry => matchesType(entry) && matchesQuery(entry)).sort((left, right) => Number(right.pinned)-Number(left.pinned) || new Date(right.createdAt) - new Date(left.createdAt));
+	state.renderedEntries = ordered;
     for (const entry of ordered) {
-      const article = document.createElement("article"); article.className = `item${entry.text ? "" : " file-item"}`; article.dataset.id = entry.id;
+	  const article = document.createElement("article"); article.className = `item${entry.text ? "" : " file-item"}${entry.pinned ? " pinned" : ""}`; article.dataset.id = entry.id;
       if (entry.text) {
         const pre = document.createElement("pre"); pre.className = "item-content"; pre.textContent = entry.text;
         article.append(pre);
@@ -329,18 +507,25 @@
       const time = document.createElement("time"); time.className = "item-time"; time.dateTime = entry.createdAt;
       time.textContent = new Intl.DateTimeFormat(undefined, { dateStyle:"medium", timeStyle:"short" }).format(new Date(entry.createdAt));
       const meta = document.createElement("div"); meta.className = "item-meta";
+	  if (entry.pinned) { const mark=document.createElement("span"); mark.className="pin-mark"; mark.textContent="★ Закреплено"; meta.append(mark); }
       if (entry.alias) { const author = document.createElement("span"); author.className = "item-alias"; author.textContent = entry.alias; meta.append(author); }
       meta.append(time);
+	  if (entry.expiresAt) { const expires=document.createElement("span"); expires.className="muted"; expires.textContent=`до ${new Intl.DateTimeFormat(undefined,{dateStyle:"short",timeStyle:"short"}).format(new Date(entry.expiresAt))}`; meta.append(expires); }
+	  if (entry.deleteAfterDownload) { const once=document.createElement("span"); once.className="muted"; once.textContent="удалится после скачивания"; meta.append(once); }
       const buttons = document.createElement("div"); buttons.className = "item-buttons";
       const toggle = document.createElement("button"); toggle.type = "button"; toggle.className = "button secondary hidden"; toggle.dataset.action = "toggle"; toggle.textContent = "Развернуть"; toggle.setAttribute("aria-expanded", "false");
       const copy = document.createElement("button"); copy.type = "button"; copy.className = "button secondary"; copy.dataset.action = "copy"; copy.textContent = "Копировать";
+	  const copyAll = document.createElement("button"); copyAll.type="button"; copyAll.className="button secondary"; copyAll.dataset.action="copy-all"; copyAll.textContent="Копировать всё";
+	  const pin = document.createElement("button"); pin.type="button"; pin.className="button secondary"; pin.dataset.action="pin"; pin.textContent=entry.pinned ? "Открепить" : "Закрепить";
       const del = document.createElement("button"); del.type = "button"; del.className = "button secondary delete"; del.dataset.action = "entry-delete"; del.textContent = "Удалить";
       if (entry.text) buttons.append(toggle, copy);
+	  if (entry.files.length) buttons.append(copyAll);
+	  if (state.canWrite) buttons.append(pin);
       if (state.canWrite) buttons.append(del);
       footer.append(meta, buttons); article.append(footer); container.append(article);
-      if (entry.text) updateItemOverflow(article);
+      if (entry.text) requestAnimationFrame(() => requestAnimationFrame(() => { if (article.isConnected) updateItemOverflow(article); }));
     }
-    $("item-count").textContent = `${ordered.length} сообщений · ${state.files.length} файлов`;
+	const total = entries.size; $("item-count").textContent = `${ordered.length}${ordered.length!==total ? ` из ${total}` : ""} сообщений · ${state.files.length} файлов`;
     show("empty", ordered.length === 0);
     if (failures) message("room-error", `${failures} элементов не удалось расшифровать`);
   }
@@ -358,7 +543,10 @@
       return;
     }
     if (button.dataset.action === "copy") { await copyText(article.querySelector("pre").textContent); toast("Текст скопирован"); return; }
+	if (button.dataset.action === "copy-all") { const entry=state.renderedEntries.find(value => value.id===article.dataset.id); const value=[entry?.text, ...(entry?.files || []).map(file => file.metadata.name)].filter(Boolean).join("\n"); await copyText(value); toast("Сообщение скопировано"); return; }
+	if (button.dataset.action === "pin") { const entry=state.renderedEntries.find(value => value.id===article.dataset.id); button.disabled=true; try { await api(`/api/rooms/${encodeURIComponent(state.roomID)}/entries/${article.dataset.id}/pin`, { method:"PUT", body:JSON.stringify({ pinned:!entry?.pinned }), write:true }); await refresh(); } catch(error) { message("room-error",error.message); button.disabled=false; } return; }
     if (button.dataset.action === "file-copy") { await copyText(attachment.dataset.name); toast("Имя файла скопировано"); return; }
+	if (button.dataset.action === "preview") { const files=state.renderedEntries.flatMap(entry => entry.files).filter(value => canPreview(value.metadata.mimeType)); state.previewIndex=Math.max(0,files.findIndex(value => value.file.id===attachment.dataset.id)); await showPreview(state.previewIndex); return; }
     if (button.dataset.action === "encrypted-download") { await startEncryptedDownload(attachment, false); return; }
     if (button.dataset.action === "encrypted-open") { await startEncryptedDownload(attachment, true); return; }
     if (button.dataset.action === "file-delete") {
@@ -376,16 +564,14 @@
 
   function renderFileAttachment(file, metadata) {
     const attachment = document.createElement("div"); attachment.className = "file-attachment"; attachment.dataset.id = file.id; attachment.dataset.name = metadata.name;
-    if (file.encrypted) attachment.dataset.metadata = JSON.stringify(metadata);
+	attachment.dataset.metadata = JSON.stringify(metadata);
     const details = document.createElement("div"); details.className = "file-details";
     const name = document.createElement("strong"); name.className = "file-name"; name.textContent = metadata.name;
     const meta = document.createElement("div"); meta.className = "item-meta";
     const size = document.createElement("span"); size.className = "muted"; size.textContent = formatBytes(file.encrypted ? metadata.size : file.size); meta.append(size);
     details.append(name, meta);
     const buttons = document.createElement("div"); buttons.className = "item-buttons";
-    const open = document.createElement(file.encrypted ? "button" : "a"); open.className = "button secondary"; open.textContent = "Открыть";
-    if (file.encrypted) { open.type = "button"; open.dataset.action = "encrypted-open"; }
-    else { open.target = "_blank"; open.rel = "noopener"; open.href = `/api/rooms/${encodeURIComponent(state.roomID)}/files/${file.id}?inline=1`; }
+	const open = document.createElement("button"); open.type="button"; open.className = "button secondary"; open.textContent = "Открыть"; open.dataset.action="preview";
     const download = document.createElement(file.encrypted ? "button" : "a"); download.className = "button primary"; download.textContent = "Скачать";
     if (file.encrypted) { download.type = "button"; download.dataset.action = "encrypted-download"; }
     else { download.download = file.name; download.href = `/api/rooms/${encodeURIComponent(state.roomID)}/files/${file.id}`; }
@@ -405,7 +591,7 @@
 
   async function ensureDownloadWorker() {
     if (!navigator.serviceWorker) throw new Error("Браузер не поддерживает потоковое скачивание зашифрованных файлов");
-    state.downloadRegistration = await navigator.serviceWorker.register("/assets/download-sw.js?v=5", { scope:"/" });
+    state.downloadRegistration = await navigator.serviceWorker.register("/assets/download-sw.js?v=7", { scope:"/" });
     await navigator.serviceWorker.ready;
     if (!navigator.serviceWorker.controller) {
       await new Promise((resolve, reject) => {
@@ -427,11 +613,47 @@
       const token = uuid();
       const channel = new MessageChannel();
       const ready = new Promise((resolve, reject) => { const timer = setTimeout(() => reject(new Error("Service Worker не ответил")), 5000); channel.port1.onmessage = () => { clearTimeout(timer); resolve(); }; });
-      navigator.serviceWorker.controller.postMessage({ type:"prepare-download", token, config:{ rawKey:state.keyText.slice(4), roomID:state.roomID, fileID:file.id, chunkSize:file.chunkSize, chunkCount:file.chunkCount, size:metadata.size, name:metadata.name, mimeType:metadata.mimeType, disposition:inline ? "inline" : "attachment", url:`/api/rooms/${encodeURIComponent(state.roomID)}/files/${file.id}` } }, [channel.port2]);
+	  const entry=state.entries.find(value=>value.id===(file.entryId||file.id));
+      navigator.serviceWorker.controller.postMessage({ type:"prepare-download", token, config:{ rawKey:state.keyText.slice(4), roomID:state.roomID, fileID:file.id, chunkSize:file.chunkSize, chunkCount:file.chunkCount, size:metadata.size, name:metadata.name, mimeType:metadata.mimeType, disposition:inline ? "inline" : "attachment", url:`/api/rooms/${encodeURIComponent(state.roomID)}/files/${file.id}`, consumeURL:entry?.deleteAfterDownload ? `/api/rooms/${encodeURIComponent(state.roomID)}/files/${file.id}/consume` : "" } }, [channel.port2]);
       await ready;
       if (inline) preview.location = `/client-download/${token}`;
       else { const frame = document.createElement("iframe"); frame.hidden = true; frame.src = `/client-download/${token}`; document.body.append(frame); setTimeout(() => frame.remove(), 60000); }
     } catch (error) { preview?.close(); message("room-error", error.message); }
+  }
+
+  async function prepareEncryptedURL(file, metadata, disposition="inline") {
+	if (!state.key || !state.keyText.startsWith("ce1_")) throw new Error("Сначала откройте ключ комнаты");
+	await ensureDownloadWorker(); const token=uuid(); const channel=new MessageChannel();
+	const ready=new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(new Error("Service Worker не ответил")),5000);channel.port1.onmessage=()=>{clearTimeout(timer);resolve();};});
+	const entry=state.entries.find(value=>value.id===(file.entryId||file.id));
+	navigator.serviceWorker.controller.postMessage({ type:"prepare-download", token, config:{ rawKey:state.keyText.slice(4), roomID:state.roomID, fileID:file.id, chunkSize:file.chunkSize, chunkCount:file.chunkCount, size:metadata.size, name:metadata.name, mimeType:metadata.mimeType, disposition, url:`/api/rooms/${encodeURIComponent(state.roomID)}/files/${file.id}`, consumeURL:entry?.deleteAfterDownload ? `/api/rooms/${encodeURIComponent(state.roomID)}/files/${file.id}/consume` : "" } }, [channel.port2]);
+	await ready; return `/client-download/${token}`;
+  }
+
+  async function showPreview(index) {
+	const files=state.renderedEntries.flatMap(entry=>entry.files).filter(value=>canPreview(value.metadata.mimeType)); if(!files.length)return;
+	state.previewIndex=(index+files.length)%files.length; const {file,metadata}=files[state.previewIndex];
+	const dialog=$("preview-dialog"), content=$("preview-content"); content.replaceChildren(); $("preview-title").textContent=metadata.name;
+	try {
+	  const url=file.encrypted ? await prepareEncryptedURL(file,metadata,"inline") : `/api/rooms/${encodeURIComponent(state.roomID)}/files/${file.id}?inline=1`;
+	  const mime=String(metadata.mimeType||"").split(";",1)[0].toLowerCase(); let element;
+	  if(mime.startsWith("image/")){element=document.createElement("img");element.alt=metadata.name;element.src=url;}
+	  else if(mime.startsWith("video/")){element=document.createElement("video");element.controls=true;element.src=url;}
+	  else if(mime.startsWith("audio/")){element=document.createElement("audio");element.controls=true;element.src=url;}
+	  else if(mime==="application/pdf"){element=document.createElement("iframe");element.title=metadata.name;element.src=url;}
+	  else { element=document.createElement("pre");element.className="preview-text";const response=await fetch(url);if(!response.ok)throw new Error(`Ошибка HTTP ${response.status}`);if(Number(response.headers.get("Content-Length")||0)>2*1024*1024)throw new Error("Текстовый preview ограничен 2 МиБ");let text=await response.text();if(mime==="application/json"){try{text=JSON.stringify(JSON.parse(text),null,2);}catch(_){}}renderHighlightedText(element,text,metadata.name,mime); }
+	  content.append(element); $("preview-download").onclick=async event=>{if(file.encrypted){event.preventDefault();const attachment=document.querySelector(`.file-attachment[data-id="${file.id}"]`);await startEncryptedDownload(attachment,false);}}; $("preview-download").href=file.encrypted?"#":`/api/rooms/${encodeURIComponent(state.roomID)}/files/${file.id}`; $("preview-download").download=metadata.name;
+	  $("preview-prev").disabled=files.length<2; $("preview-next").disabled=files.length<2; if(!dialog.open)dialog.showModal();
+	} catch(error){content.textContent=error.message;if(!dialog.open)dialog.showModal();}
+  }
+
+  function closePreview(){const dialog=$("preview-dialog");$("preview-content").replaceChildren();if(dialog.open)dialog.close();}
+
+  function renderHighlightedText(container,text,name,mime){
+	const codeLike=mime==="application/json" || /\.(go|js|ts|tsx|jsx|py|rb|rs|java|kt|swift|sh|bash|yaml|yml|toml|sql|css|html)$/i.test(name);
+	if(!codeLike){container.textContent=text;return;}
+	const pattern=/(\/\/[^\n]*|#[^\n]*|\/\*[\s\S]*?\*\/|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\b(?:true|false|null|nil|return|func|function|const|let|var|if|else|for|while|class|struct|package|import|from|def|async|await|SELECT|FROM|WHERE|INSERT|UPDATE|DELETE)\b|\b\d+(?:\.\d+)?\b)/g;
+	let offset=0;for(const match of text.matchAll(pattern)){container.append(document.createTextNode(text.slice(offset,match.index)));const span=document.createElement("span");span.textContent=match[0];span.className=/^(\/\/|#|\/\*)/.test(match[0])?"syntax-comment":/^["']/.test(match[0])?"syntax-string":/^\d/.test(match[0])?"syntax-number":"syntax-keyword";container.append(span);offset=match.index+match[0].length;}container.append(document.createTextNode(text.slice(offset)));
   }
 
   function canPreview(value) {
@@ -441,7 +663,7 @@
     return ["text/plain", "text/csv", "application/json", "application/pdf"].includes(mediaType);
   }
 
-  function uploadStorageKey(file) { return `clipboard-exchange:upload:${state.roomID}:${file.name}:${file.size}`; }
+  function uploadStorageKey(file) { return `clipboard-exchange:upload:${state.roomID}:${file.name}:${file.size}:${file.lastModified || 0}:${file.type || ""}`; }
   function loadUploadSession(file) { try { return JSON.parse(localStorage.getItem(uploadStorageKey(file)) || "null"); } catch (_) { return null; } }
   function saveUploadSession(file, session) { try { localStorage.setItem(uploadStorageKey(file), JSON.stringify(session)); } catch (_) {} }
   function removeUploadSession(file) { try { localStorage.removeItem(uploadStorageKey(file)); } catch (_) {} }
@@ -491,11 +713,12 @@
     const pending = { file, row, progress, status, actions, control, started: false };
     state.pendingFiles.push(pending);
     cancel.addEventListener("click", async () => {
-      control.cancelled = true; control.controller?.abort(); cancel.disabled = true;
-      if (control.session) await uploadAPI(`/api/rooms/${encodeURIComponent(state.roomID)}/uploads/${control.session.id}`, { method:"DELETE" }, control.session.uploadToken).catch(() => {});
-      if (pending.started) removeUploadSession(file);
-      state.pendingFiles = state.pendingFiles.filter((entry) => entry !== pending);
-      row.remove();
+	  const group = control.group || [pending];
+	  for (const member of group) { member.control.cancelled = true; member.control.controller?.abort(); removeUploadSession(member.file); member.row.remove(); }
+	  cancel.disabled = true;
+	  if (pending.started && control.entryID) await api(`/api/rooms/${encodeURIComponent(state.roomID)}/entries/${control.entryID}`, { method:"DELETE", write:true }).catch(() => {});
+	  else if (control.session) await uploadAPI(`/api/rooms/${encodeURIComponent(state.roomID)}/uploads/${control.session.id}`, { method:"DELETE" }, control.session.uploadToken).catch(() => {});
+	  state.pendingFiles = state.pendingFiles.filter((entry) => !group.includes(entry));
     });
   }
 
@@ -552,13 +775,19 @@
       status.textContent = "Завершение…";
       const manifest = session.encrypted ? await encryptFileManifest(session) : null;
       await uploadAPI(`/api/rooms/${encodeURIComponent(state.roomID)}/uploads/${session.id}/complete`, { method:"POST", body:manifest ? JSON.stringify(manifest) : undefined, headers:manifest ? { "Content-Type":"application/json" } : {} }, session.uploadToken);
-      removeUploadSession(file); status.textContent = "Готово"; await refresh(); setTimeout(() => row.remove(), 700);
+      removeUploadSession(file); status.textContent = "Готово"; setTimeout(() => row.remove(), 700);
+	  return session;
     } catch (error) {
-      if (control.cancelled || error.name === "AbortError") return;
+      if (control.cancelled) return;
       status.textContent = `Ошибка: ${error.message}`;
       let retry = actions.querySelector('[data-action="upload-retry"]');
       if (!retry) { retry = document.createElement("button"); retry.type = "button"; retry.className = "button secondary"; retry.dataset.action = "upload-retry"; retry.textContent = "Повторить"; actions.prepend(retry); }
-      retry.onclick = () => { retry.remove(); runUpload(file, row, progress, status, actions, control, control.entryID, control.entryIndex).catch(() => {}); };
+	  retry.onclick = async () => {
+		retry.remove();
+		try { await runUpload(file, row, progress, status, actions, control, control.entryID, control.entryIndex); await commitEntry(control.entryID); await refresh(); }
+		catch (retryError) { if (retryError.status !== 409) message("room-error", retryError.message); }
+	  };
+	  throw error;
     }
   }
 
@@ -567,7 +796,7 @@
     const toggle = article.querySelector('[data-action="toggle"]');
     const expanded = toggle.getAttribute("aria-expanded") === "true";
     pre.classList.add("collapsed");
-    const overflowing = pre.scrollHeight > pre.clientHeight + 1;
+    const overflowing = pre.textContent.split("\n").length > 2 || pre.scrollHeight > pre.clientHeight + 1;
     toggle.classList.toggle("hidden", !overflowing);
     if (!overflowing) {
       pre.classList.remove("collapsed");
@@ -629,5 +858,7 @@
     } catch (error) { message("room-error", error.message); }
   }
 
-  if (roomMatch) initRoom(); else if (location.pathname === "/") initHome();
+	document.addEventListener("visibilitychange",()=>{if(!document.hidden){state.unread=0;updateUnread();}});
+	initPWA();
+  if (roomMatch) initRoom(); else if (location.pathname === "/" || location.pathname === "/share-target") initHome();
 })();

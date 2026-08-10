@@ -26,8 +26,35 @@ type Room struct {
 	KeyID          string `json:"keyId,omitempty"`
 	WriteProtected bool   `json:"writeProtected"`
 	WriteHash      string `json:"-"`
+	TTLSeconds     int64  `json:"ttlSeconds,omitempty"`
 	CreatedAt      string `json:"createdAt"`
 	UpdatedAt      string `json:"updatedAt"`
+}
+
+type Entry struct {
+	ID                  string `json:"id"`
+	RoomID              string `json:"-"`
+	ExpectedFiles       int    `json:"expectedFiles"`
+	Published           bool   `json:"published"`
+	Pinned              bool   `json:"pinned,omitempty"`
+	ExpiresAt           string `json:"expiresAt,omitempty"`
+	DeleteAfterDownload bool   `json:"deleteAfterDownload,omitempty"`
+	CreatedAt           string `json:"createdAt"`
+}
+
+type DeletedObjects struct {
+	FileIDs   []string
+	UploadIDs []string
+}
+
+type Statistics struct {
+	Rooms         int64
+	Items         int64
+	Entries       int64
+	Files         int64
+	FileBytes     int64
+	ActiveUploads int64
+	ReservedBytes int64
 }
 
 type Item struct {
@@ -104,7 +131,7 @@ func Open(path string) (*Store, error) {
 			db.Close()
 			return nil, errors.New("legacy database schema is unsupported; archive it and start with an empty database")
 		}
-	} else if version != 2 && version != 3 && version != 4 {
+	} else if version != 2 && version != 3 && version != 4 && version != 5 {
 		db.Close()
 		return nil, fmt.Errorf("unsupported database schema version %d", version)
 	}
@@ -177,6 +204,28 @@ func Open(path string) (*Store, error) {
 			db.Close()
 			return nil, fmt.Errorf("commit entry grouping migration: %w", err)
 		}
+		version = 4
+	}
+	if version == 4 {
+		tx, err := db.Begin()
+		if err != nil {
+			db.Close()
+			return nil, fmt.Errorf("start atomic entries migration: %w", err)
+		}
+		if _, err := tx.Exec(`ALTER TABLE rooms ADD COLUMN ttl_seconds INTEGER NOT NULL DEFAULT 0`); err != nil {
+			tx.Rollback()
+			db.Close()
+			return nil, fmt.Errorf("migrate room TTL schema: %w", err)
+		}
+		if _, err := tx.Exec(`PRAGMA user_version=5`); err != nil {
+			tx.Rollback()
+			db.Close()
+			return nil, fmt.Errorf("record atomic entries migration: %w", err)
+		}
+		if err := tx.Commit(); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("commit atomic entries migration: %w", err)
+		}
 	}
 	for _, stmt := range []string{
 		`PRAGMA journal_mode=WAL`,
@@ -188,6 +237,7 @@ func Open(path string) (*Store, error) {
 			key_id TEXT NOT NULL DEFAULT '',
 			write_protected INTEGER NOT NULL DEFAULT 1,
 			write_hash TEXT NOT NULL DEFAULT '',
+			ttl_seconds INTEGER NOT NULL DEFAULT 0,
 			created_at TEXT NOT NULL,
 			updated_at TEXT NOT NULL
 		)`,
@@ -204,6 +254,19 @@ func Open(path string) (*Store, error) {
 			created_at TEXT NOT NULL
 		)`,
 		`CREATE INDEX IF NOT EXISTS items_room_created ON items(room_id, created_at, id)`,
+		`CREATE TABLE IF NOT EXISTS entries (
+			id TEXT NOT NULL,
+			room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+			expected_files INTEGER NOT NULL DEFAULT 0,
+			published INTEGER NOT NULL DEFAULT 0,
+			pinned INTEGER NOT NULL DEFAULT 0,
+			expires_at TEXT NOT NULL DEFAULT '',
+			delete_after_download INTEGER NOT NULL DEFAULT 0,
+			created_at TEXT NOT NULL,
+			PRIMARY KEY(room_id, id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS entries_room_published ON entries(room_id, published, created_at, id)`,
+		`CREATE INDEX IF NOT EXISTS entries_expiry ON entries(expires_at)`,
 		`CREATE INDEX IF NOT EXISTS rooms_updated ON rooms(updated_at)`,
 		`CREATE TABLE IF NOT EXISTS uploads (
 			id TEXT PRIMARY KEY,
@@ -255,7 +318,7 @@ func Open(path string) (*Store, error) {
 		`CREATE INDEX IF NOT EXISTS uploads_expiry ON uploads(expires_at)`,
 		`CREATE INDEX IF NOT EXISTS files_room_created ON files(room_id, created_at, id)`,
 		`CREATE INDEX IF NOT EXISTS files_room_entry ON files(room_id, entry_id)`,
-		`PRAGMA user_version=4`,
+		`PRAGMA user_version=5`,
 	} {
 		if _, err := db.Exec(stmt); err != nil {
 			db.Close()
@@ -266,6 +329,16 @@ func Open(path string) (*Store, error) {
 }
 
 func (s *Store) Close() error { return s.db.Close() }
+
+func (s *Store) Snapshot(ctx context.Context, target string) error {
+	if target == "" {
+		return errors.New("snapshot target is empty")
+	}
+	if _, err := s.db.ExecContext(ctx, `VACUUM INTO ?`, target); err != nil {
+		return fmt.Errorf("create SQLite snapshot: %w", err)
+	}
+	return nil
+}
 
 func (s *Store) CreateRoom(ctx context.Context, room Room, maxRooms int) error {
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -281,7 +354,7 @@ func (s *Store) CreateRoom(ctx context.Context, room Room, maxRooms int) error {
 		return ErrLimit
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	_, err = tx.ExecContext(ctx, `INSERT INTO rooms(id, encrypted, key_id, write_protected, write_hash, created_at, updated_at) VALUES(?,?,?,?,?,?,?)`, room.ID, room.Encrypted, room.KeyID, room.WriteProtected, room.WriteHash, now, now)
+	_, err = tx.ExecContext(ctx, `INSERT INTO rooms(id, encrypted, key_id, write_protected, write_hash, ttl_seconds, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?)`, room.ID, room.Encrypted, room.KeyID, room.WriteProtected, room.WriteHash, room.TTLSeconds, now, now)
 	if err != nil {
 		if isConstraint(err) {
 			return ErrConflict
@@ -294,7 +367,7 @@ func (s *Store) CreateRoom(ctx context.Context, room Room, maxRooms int) error {
 func (s *Store) GetRoom(ctx context.Context, id string) (Room, error) {
 	var room Room
 	var encrypted, writeProtected int
-	err := s.db.QueryRowContext(ctx, `SELECT id, encrypted, key_id, write_protected, write_hash, created_at, updated_at FROM rooms WHERE id=?`, id).Scan(&room.ID, &encrypted, &room.KeyID, &writeProtected, &room.WriteHash, &room.CreatedAt, &room.UpdatedAt)
+	err := s.db.QueryRowContext(ctx, `SELECT id, encrypted, key_id, write_protected, write_hash, ttl_seconds, created_at, updated_at FROM rooms WHERE id=?`, id).Scan(&room.ID, &encrypted, &room.KeyID, &writeProtected, &room.WriteHash, &room.TTLSeconds, &room.CreatedAt, &room.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Room{}, ErrNotFound
 	}
@@ -307,7 +380,11 @@ func (s *Store) ListItems(ctx context.Context, roomID string) ([]Item, error) {
 	if _, err := s.GetRoom(ctx, roomID); err != nil {
 		return nil, err
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT id, kind, content, alias, ciphertext, iv, key_id, version, created_at FROM items WHERE room_id=? ORDER BY created_at DESC, id DESC`, roomID)
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	rows, err := s.db.QueryContext(ctx, `SELECT i.id,i.kind,i.content,i.alias,i.ciphertext,i.iv,i.key_id,i.version,i.created_at
+		FROM items i LEFT JOIN entries e ON e.room_id=i.room_id AND e.id=i.id
+		WHERE i.room_id=? AND (e.id IS NULL OR (e.published=1 AND (e.expires_at='' OR e.expires_at>?)))
+		ORDER BY COALESCE(e.pinned,0) DESC,i.created_at DESC,i.id DESC`, roomID, now)
 	if err != nil {
 		return nil, err
 	}
@@ -327,7 +404,11 @@ func (s *Store) ListFiles(ctx context.Context, roomID string) ([]File, error) {
 	if _, err := s.GetRoom(ctx, roomID); err != nil {
 		return nil, err
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT id,room_id,entry_id,entry_index,name,mime_type,alias,size,encrypted,key_id,manifest_ciphertext,manifest_iv,version,chunk_size,chunk_count,created_at FROM files WHERE room_id=? ORDER BY created_at DESC, id DESC`, roomID)
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	rows, err := s.db.QueryContext(ctx, `SELECT f.id,f.room_id,f.entry_id,f.entry_index,f.name,f.mime_type,f.alias,f.size,f.encrypted,f.key_id,f.manifest_ciphertext,f.manifest_iv,f.version,f.chunk_size,f.chunk_count,f.created_at
+		FROM files f LEFT JOIN entries e ON e.room_id=f.room_id AND e.id=f.entry_id
+		WHERE f.room_id=? AND (e.id IS NULL OR (e.published=1 AND (e.expires_at='' OR e.expires_at>?)))
+		ORDER BY COALESCE(e.pinned,0) DESC,f.created_at DESC,f.id DESC`, roomID, now)
 	if err != nil {
 		return nil, err
 	}
@@ -343,6 +424,172 @@ func (s *Store) ListFiles(ctx context.Context, roomID string) ([]File, error) {
 		files = append(files, file)
 	}
 	return files, rows.Err()
+}
+
+func (s *Store) ListEntries(ctx context.Context, roomID string) ([]Entry, error) {
+	if _, err := s.GetRoom(ctx, roomID); err != nil {
+		return nil, err
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	rows, err := s.db.QueryContext(ctx, `SELECT id,room_id,expected_files,published,pinned,expires_at,delete_after_download,created_at
+		FROM entries WHERE room_id=? AND published=1 AND (expires_at='' OR expires_at>?)
+		ORDER BY pinned DESC,created_at DESC,id DESC`, roomID, now)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	entries := make([]Entry, 0)
+	for rows.Next() {
+		var entry Entry
+		var published, pinned, deleteAfterDownload int
+		if err := rows.Scan(&entry.ID, &entry.RoomID, &entry.ExpectedFiles, &published, &pinned, &entry.ExpiresAt, &deleteAfterDownload, &entry.CreatedAt); err != nil {
+			return nil, err
+		}
+		entry.Published = published != 0
+		entry.Pinned = pinned != 0
+		entry.DeleteAfterDownload = deleteAfterDownload != 0
+		entries = append(entries, entry)
+	}
+	return entries, rows.Err()
+}
+
+func (s *Store) GetEntry(ctx context.Context, roomID, entryID string) (Entry, error) {
+	var entry Entry
+	var published, pinned, deleteAfterDownload int
+	err := s.db.QueryRowContext(ctx, `SELECT id,room_id,expected_files,published,pinned,expires_at,delete_after_download,created_at FROM entries WHERE room_id=? AND id=?`, roomID, entryID).Scan(&entry.ID, &entry.RoomID, &entry.ExpectedFiles, &published, &pinned, &entry.ExpiresAt, &deleteAfterDownload, &entry.CreatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Entry{}, ErrNotFound
+	}
+	entry.Published = published != 0
+	entry.Pinned = pinned != 0
+	entry.DeleteAfterDownload = deleteAfterDownload != 0
+	return entry, err
+}
+
+func (s *Store) CreateEntry(ctx context.Context, roomID string, entry Entry, item *Item, maxItems int) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var encrypted int
+	var roomKeyID string
+	if err := tx.QueryRowContext(ctx, `SELECT encrypted,key_id FROM rooms WHERE id=?`, roomID).Scan(&encrypted, &roomKeyID); errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	} else if err != nil {
+		return err
+	}
+	var count int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM (
+		SELECT id FROM entries WHERE room_id=?
+		UNION SELECT id FROM items WHERE room_id=?
+		UNION SELECT entry_id FROM files WHERE room_id=?)`, roomID, roomID, roomID).Scan(&count); err != nil {
+		return err
+	}
+	if count >= maxItems {
+		return ErrLimit
+	}
+	if item != nil && ((encrypted != 0) != (item.Kind == "encrypted") || (encrypted != 0 && roomKeyID != item.KeyID)) {
+		return ErrConflict
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	entry.RoomID, entry.CreatedAt = roomID, now
+	_, err = tx.ExecContext(ctx, `INSERT INTO entries(id,room_id,expected_files,published,pinned,expires_at,delete_after_download,created_at) VALUES(?,?,?,?,?,?,?,?)`, entry.ID, roomID, entry.ExpectedFiles, false, false, entry.ExpiresAt, entry.DeleteAfterDownload, now)
+	if err != nil {
+		if isConstraint(err) {
+			return ErrConflict
+		}
+		return err
+	}
+	if item != nil {
+		_, err = tx.ExecContext(ctx, `INSERT INTO items(id,room_id,kind,content,alias,ciphertext,iv,key_id,version,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)`, entry.ID, roomID, item.Kind, item.Content, item.Alias, item.Ciphertext, item.IV, item.KeyID, item.Version, now)
+		if err != nil {
+			if isConstraint(err) {
+				return ErrConflict
+			}
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (s *Store) CommitEntry(ctx context.Context, roomID, entryID string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var expected, published int
+	if err := tx.QueryRowContext(ctx, `SELECT expected_files,published FROM entries WHERE room_id=? AND id=?`, roomID, entryID).Scan(&expected, &published); errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	} else if err != nil {
+		return err
+	}
+	if published != 0 {
+		return nil
+	}
+	var completed, active int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM files WHERE room_id=? AND entry_id=?`, roomID, entryID).Scan(&completed); err != nil {
+		return err
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM uploads WHERE room_id=? AND entry_id=?`, roomID, entryID).Scan(&active); err != nil {
+		return err
+	}
+	if completed != expected || active != 0 {
+		return ErrConflict
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := tx.ExecContext(ctx, `UPDATE entries SET published=1 WHERE room_id=? AND id=?`, roomID, entryID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE rooms SET updated_at=? WHERE id=?`, now, roomID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Store) EntryForFile(ctx context.Context, roomID, fileID string) (Entry, error) {
+	var entry Entry
+	var published, pinned, deleteAfterDownload int
+	err := s.db.QueryRowContext(ctx, `SELECT e.id,e.room_id,e.expected_files,e.published,e.pinned,e.expires_at,e.delete_after_download,e.created_at
+		FROM files f JOIN entries e ON e.room_id=f.room_id AND e.id=f.entry_id
+		WHERE f.room_id=? AND f.id=?`, roomID, fileID).Scan(&entry.ID, &entry.RoomID, &entry.ExpectedFiles, &published, &pinned, &entry.ExpiresAt, &deleteAfterDownload, &entry.CreatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Entry{}, ErrNotFound
+	}
+	entry.Published = published != 0
+	entry.Pinned = pinned != 0
+	entry.DeleteAfterDownload = deleteAfterDownload != 0
+	return entry, err
+}
+
+func (s *Store) PinEntry(ctx context.Context, roomID, entryID string, pinned bool) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var exists int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM (SELECT id FROM items WHERE room_id=? AND id=? UNION SELECT entry_id FROM files WHERE room_id=? AND entry_id=?)`, roomID, entryID, roomID, entryID).Scan(&exists); err != nil {
+		return err
+	}
+	if exists == 0 {
+		return ErrNotFound
+	}
+	var fileCount int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM files WHERE room_id=? AND entry_id=?`, roomID, entryID).Scan(&fileCount); err != nil {
+		return err
+	}
+	var createdAt string
+	if err := tx.QueryRowContext(ctx, `SELECT MIN(created_at) FROM (SELECT created_at FROM items WHERE room_id=? AND id=? UNION ALL SELECT created_at FROM files WHERE room_id=? AND entry_id=?)`, roomID, entryID, roomID, entryID).Scan(&createdAt); err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO entries(id,room_id,expected_files,published,pinned,created_at) VALUES(?,?,?,?,?,?)
+		ON CONFLICT(room_id,id) DO UPDATE SET pinned=excluded.pinned`, entryID, roomID, fileCount, true, pinned, createdAt)
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) AddItem(ctx context.Context, roomID string, item Item, maxItems int) error {
@@ -464,6 +711,24 @@ func (s *Store) CreateUpload(ctx context.Context, upload Upload, maxRoomBytes in
 	}
 	if (encrypted != 0) != upload.Encrypted || (upload.Encrypted && roomKeyID != upload.KeyID) {
 		return ErrConflict
+	}
+	var expectedFiles, published int
+	err = tx.QueryRowContext(ctx, `SELECT expected_files,published FROM entries WHERE room_id=? AND id=?`, upload.RoomID, upload.EntryID).Scan(&expectedFiles, &published)
+	if err == nil {
+		if published != 0 || upload.EntryIndex >= expectedFiles {
+			return ErrConflict
+		}
+		var duplicate int
+		if err := tx.QueryRowContext(ctx, `SELECT
+			(SELECT COUNT(*) FROM uploads WHERE room_id=? AND entry_id=? AND entry_index=?)+
+			(SELECT COUNT(*) FROM files WHERE room_id=? AND entry_id=? AND entry_index=?)`, upload.RoomID, upload.EntryID, upload.EntryIndex, upload.RoomID, upload.EntryID, upload.EntryIndex).Scan(&duplicate); err != nil {
+			return err
+		}
+		if duplicate != 0 {
+			return ErrConflict
+		}
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return err
 	}
 	var active int
 	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM uploads`).Scan(&active); err != nil {
@@ -622,7 +887,10 @@ func (s *Store) AbortUpload(ctx context.Context, roomID, uploadID string) error 
 func (s *Store) GetFile(ctx context.Context, roomID, fileID string) (File, error) {
 	var file File
 	var encrypted int
-	err := s.db.QueryRowContext(ctx, `SELECT id,room_id,entry_id,entry_index,name,mime_type,alias,size,encrypted,key_id,manifest_ciphertext,manifest_iv,version,chunk_size,chunk_count,created_at FROM files WHERE id=? AND room_id=?`, fileID, roomID).Scan(&file.ID, &file.RoomID, &file.EntryID, &file.EntryIndex, &file.Name, &file.MIMEType, &file.Alias, &file.Size, &encrypted, &file.KeyID, &file.ManifestCiphertext, &file.ManifestIV, &file.Version, &file.ChunkSize, &file.ChunkCount, &file.CreatedAt)
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	err := s.db.QueryRowContext(ctx, `SELECT f.id,f.room_id,f.entry_id,f.entry_index,f.name,f.mime_type,f.alias,f.size,f.encrypted,f.key_id,f.manifest_ciphertext,f.manifest_iv,f.version,f.chunk_size,f.chunk_count,f.created_at
+		FROM files f LEFT JOIN entries e ON e.room_id=f.room_id AND e.id=f.entry_id
+		WHERE f.id=? AND f.room_id=? AND (e.id IS NULL OR (e.published=1 AND (e.expires_at='' OR e.expires_at>?)))`, fileID, roomID, now).Scan(&file.ID, &file.RoomID, &file.EntryID, &file.EntryIndex, &file.Name, &file.MIMEType, &file.Alias, &file.Size, &encrypted, &file.KeyID, &file.ManifestCiphertext, &file.ManifestIV, &file.Version, &file.ChunkSize, &file.ChunkCount, &file.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return File{}, ErrNotFound
 	}
@@ -650,51 +918,129 @@ func (s *Store) DeleteFile(ctx context.Context, roomID, fileID string) error {
 	return tx.Commit()
 }
 
-// DeleteEntry removes a text item and every file attached to the same entry.
-// It returns object IDs so the caller can remove their filesystem payloads
-// after the metadata transaction has committed.
-func (s *Store) DeleteEntry(ctx context.Context, roomID, entryID string) ([]string, error) {
+// DeleteEntry removes a text item, completed files, active uploads and entry
+// metadata. Filesystem payloads are returned for cleanup after commit.
+func (s *Store) DeleteEntry(ctx context.Context, roomID, entryID string) (DeletedObjects, error) {
+	return s.deleteEntry(ctx, roomID, entryID, true)
+}
+
+func (s *Store) deleteEntry(ctx context.Context, roomID, entryID string, touchRoom bool) (DeletedObjects, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return nil, err
+		return DeletedObjects{}, err
 	}
 	defer tx.Rollback()
 	rows, err := tx.QueryContext(ctx, `SELECT id FROM files WHERE room_id=? AND entry_id=?`, roomID, entryID)
 	if err != nil {
-		return nil, err
+		return DeletedObjects{}, err
 	}
-	var fileIDs []string
+	var deleted DeletedObjects
 	for rows.Next() {
 		var id string
 		if err := rows.Scan(&id); err != nil {
 			rows.Close()
-			return nil, err
+			return DeletedObjects{}, err
 		}
-		fileIDs = append(fileIDs, id)
+		deleted.FileIDs = append(deleted.FileIDs, id)
 	}
 	if err := rows.Close(); err != nil {
-		return nil, err
+		return DeletedObjects{}, err
+	}
+	rows, err = tx.QueryContext(ctx, `SELECT id FROM uploads WHERE room_id=? AND entry_id=?`, roomID, entryID)
+	if err != nil {
+		return DeletedObjects{}, err
+	}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return DeletedObjects{}, err
+		}
+		deleted.UploadIDs = append(deleted.UploadIDs, id)
+	}
+	if err := rows.Close(); err != nil {
+		return DeletedObjects{}, err
 	}
 	itemResult, err := tx.ExecContext(ctx, `DELETE FROM items WHERE room_id=? AND id=?`, roomID, entryID)
 	if err != nil {
-		return nil, err
+		return DeletedObjects{}, err
 	}
 	fileResult, err := tx.ExecContext(ctx, `DELETE FROM files WHERE room_id=? AND entry_id=?`, roomID, entryID)
 	if err != nil {
-		return nil, err
+		return DeletedObjects{}, err
+	}
+	uploadResult, err := tx.ExecContext(ctx, `DELETE FROM uploads WHERE room_id=? AND entry_id=?`, roomID, entryID)
+	if err != nil {
+		return DeletedObjects{}, err
+	}
+	entryResult, err := tx.ExecContext(ctx, `DELETE FROM entries WHERE room_id=? AND id=?`, roomID, entryID)
+	if err != nil {
+		return DeletedObjects{}, err
 	}
 	itemsDeleted, _ := itemResult.RowsAffected()
 	filesDeleted, _ := fileResult.RowsAffected()
-	if itemsDeleted+filesDeleted == 0 {
-		return nil, ErrNotFound
+	uploadsDeleted, _ := uploadResult.RowsAffected()
+	entriesDeleted, _ := entryResult.RowsAffected()
+	if itemsDeleted+filesDeleted+uploadsDeleted+entriesDeleted == 0 {
+		return DeletedObjects{}, ErrNotFound
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE rooms SET updated_at=? WHERE id=?`, time.Now().UTC().Format(time.RFC3339Nano), roomID); err != nil {
-		return nil, err
+	if touchRoom {
+		if _, err := tx.ExecContext(ctx, `UPDATE rooms SET updated_at=? WHERE id=?`, time.Now().UTC().Format(time.RFC3339Nano), roomID); err != nil {
+			return DeletedObjects{}, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
-		return nil, err
+		return DeletedObjects{}, err
 	}
-	return fileIDs, nil
+	return deleted, nil
+}
+
+func (s *Store) ClearRoom(ctx context.Context, roomID string) (DeletedObjects, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return DeletedObjects{}, err
+	}
+	defer tx.Rollback()
+	var exists int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM rooms WHERE id=?`, roomID).Scan(&exists); err != nil {
+		return DeletedObjects{}, err
+	}
+	if exists == 0 {
+		return DeletedObjects{}, ErrNotFound
+	}
+	deleted := DeletedObjects{}
+	for query, target := range map[string]*[]string{
+		`SELECT id FROM files WHERE room_id=?`:   &deleted.FileIDs,
+		`SELECT id FROM uploads WHERE room_id=?`: &deleted.UploadIDs,
+	} {
+		rows, err := tx.QueryContext(ctx, query, roomID)
+		if err != nil {
+			return DeletedObjects{}, err
+		}
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				return DeletedObjects{}, err
+			}
+			*target = append(*target, id)
+		}
+		if err := rows.Close(); err != nil {
+			return DeletedObjects{}, err
+		}
+	}
+	for _, query := range []string{`DELETE FROM items WHERE room_id=?`, `DELETE FROM files WHERE room_id=?`, `DELETE FROM uploads WHERE room_id=?`, `DELETE FROM entries WHERE room_id=?`} {
+		if _, err := tx.ExecContext(ctx, query, roomID); err != nil {
+			return DeletedObjects{}, err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE rooms SET updated_at=? WHERE id=?`, time.Now().UTC().Format(time.RFC3339Nano), roomID); err != nil {
+		return DeletedObjects{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return DeletedObjects{}, err
+	}
+	return deleted, nil
 }
 
 func (s *Store) DeleteExpiredUploads(ctx context.Context, before time.Time) ([]string, error) {
@@ -723,6 +1069,36 @@ func (s *Store) DeleteExpiredUploads(ctx context.Context, before time.Time) ([]s
 		}
 	}
 	return ids, nil
+}
+
+func (s *Store) DeleteExpiredEntries(ctx context.Context, before time.Time) (DeletedObjects, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT room_id,id FROM entries WHERE expires_at<>'' AND expires_at<=?`, before.UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return DeletedObjects{}, err
+	}
+	type ref struct{ roomID, entryID string }
+	var refs []ref
+	for rows.Next() {
+		var value ref
+		if err := rows.Scan(&value.roomID, &value.entryID); err != nil {
+			rows.Close()
+			return DeletedObjects{}, err
+		}
+		refs = append(refs, value)
+	}
+	if err := rows.Close(); err != nil {
+		return DeletedObjects{}, err
+	}
+	var deleted DeletedObjects
+	for _, value := range refs {
+		objects, err := s.deleteEntry(ctx, value.roomID, value.entryID, false)
+		if err != nil && !errors.Is(err, ErrNotFound) {
+			return deleted, err
+		}
+		deleted.FileIDs = append(deleted.FileIDs, objects.FileIDs...)
+		deleted.UploadIDs = append(deleted.UploadIDs, objects.UploadIDs...)
+	}
+	return deleted, nil
 }
 
 func (s *Store) StorageReferences(ctx context.Context) (map[string]bool, map[string]bool, error) {
@@ -767,11 +1143,110 @@ func (s *Store) DeleteInactive(ctx context.Context, before time.Time) (int64, er
 	return result.RowsAffected()
 }
 
-func (s *Store) RunCleanup(ctx context.Context, ttl, interval time.Duration) {
-	if ttl == 0 {
-		return
+func (s *Store) DeleteExpiredRooms(ctx context.Context, now time.Time, defaultTTL time.Duration) (int64, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id,ttl_seconds,updated_at FROM rooms`)
+	if err != nil {
+		return 0, err
 	}
-	_, _ = s.DeleteInactive(ctx, time.Now().Add(-ttl))
+	type candidate struct {
+		id      string
+		ttl     int64
+		updated string
+	}
+	var candidates []candidate
+	for rows.Next() {
+		var value candidate
+		if err := rows.Scan(&value.id, &value.ttl, &value.updated); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		candidates = append(candidates, value)
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+	var deleted int64
+	for _, value := range candidates {
+		ttl := defaultTTL
+		if value.ttl > 0 {
+			ttl = time.Duration(value.ttl) * time.Second
+		}
+		if ttl == 0 {
+			continue
+		}
+		updated, err := time.Parse(time.RFC3339Nano, value.updated)
+		if err != nil || now.Sub(updated) < ttl {
+			continue
+		}
+		result, err := s.db.ExecContext(ctx, `DELETE FROM rooms WHERE id=?`, value.id)
+		if err != nil {
+			return deleted, err
+		}
+		n, _ := result.RowsAffected()
+		deleted += n
+	}
+	return deleted, nil
+}
+
+func (s *Store) ListRooms(ctx context.Context) ([]Room, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id,encrypted,key_id,write_protected,write_hash,ttl_seconds,created_at,updated_at FROM rooms ORDER BY updated_at DESC,id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	rooms := make([]Room, 0)
+	for rows.Next() {
+		var room Room
+		var encrypted, writeProtected int
+		if err := rows.Scan(&room.ID, &encrypted, &room.KeyID, &writeProtected, &room.WriteHash, &room.TTLSeconds, &room.CreatedAt, &room.UpdatedAt); err != nil {
+			return nil, err
+		}
+		room.Encrypted = encrypted != 0
+		room.WriteProtected = writeProtected != 0
+		rooms = append(rooms, room)
+	}
+	return rooms, rows.Err()
+}
+
+func (s *Store) DeleteRoom(ctx context.Context, roomID string) (DeletedObjects, error) {
+	deleted, err := s.ClearRoom(ctx, roomID)
+	if err != nil {
+		return DeletedObjects{}, err
+	}
+	result, err := s.db.ExecContext(ctx, `DELETE FROM rooms WHERE id=?`, roomID)
+	if err != nil {
+		return DeletedObjects{}, err
+	}
+	if n, _ := result.RowsAffected(); n == 0 {
+		return DeletedObjects{}, ErrNotFound
+	}
+	return deleted, nil
+}
+
+func (s *Store) Stats(ctx context.Context) (Statistics, error) {
+	var stats Statistics
+	queries := []struct {
+		query  string
+		target *int64
+	}{
+		{`SELECT COUNT(*) FROM rooms`, &stats.Rooms},
+		{`SELECT COUNT(*) FROM items`, &stats.Items},
+		{`SELECT COUNT(*) FROM entries`, &stats.Entries},
+		{`SELECT COUNT(*) FROM files`, &stats.Files},
+		{`SELECT COALESCE(SUM(size),0) FROM files`, &stats.FileBytes},
+		{`SELECT COUNT(*) FROM uploads`, &stats.ActiveUploads},
+		{`SELECT COALESCE(SUM(size),0) FROM uploads`, &stats.ReservedBytes},
+	}
+	for _, value := range queries {
+		if err := s.db.QueryRowContext(ctx, value.query).Scan(value.target); err != nil {
+			return Statistics{}, err
+		}
+	}
+	return stats, nil
+}
+
+func (s *Store) RunCleanup(ctx context.Context, ttl, interval time.Duration) {
+	_, _ = s.DeleteExpiredRooms(ctx, time.Now(), ttl)
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -779,7 +1254,7 @@ func (s *Store) RunCleanup(ctx context.Context, ttl, interval time.Duration) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			_, _ = s.DeleteInactive(ctx, time.Now().Add(-ttl))
+			_, _ = s.DeleteExpiredRooms(ctx, time.Now(), ttl)
 		}
 	}
 }

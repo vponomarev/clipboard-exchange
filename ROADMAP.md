@@ -118,3 +118,18 @@ client-side расшифрование и очистка storage.
 4. Общие contract tests и cross-client interoperability matrix.
 5. Подключение файлов после стабилизации фазы 2.
 6. Store publication, если она требуется.
+
+## Фаза 2.5 — productivity и эксплуатация
+
+Статус: реализована и прошла Go, browser matrix и Linux lab smoke. Подробная
+спецификация: [PHASE25.md](PHASE25.md).
+
+- installable PWA и Android Web Share Target;
+- clipboard paste/read для текста, изображений и файлов;
+- client-side поиск, фильтры, pins и unread navigation;
+- recent/favorite rooms и явное безопасное запоминание ключей;
+- атомарная публикация текста с группой файлов;
+- TTL комнат/записей, clear room и best-effort download-once;
+- расширенный passive preview без выполнения active content;
+- browser notifications и опциональный sound;
+- CLI status/rooms/backup/restore/reconcile и Prometheus metrics.

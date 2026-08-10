@@ -1,5 +1,14 @@
 const { test, expect } = require("@playwright/test");
 
+async function selectFiles(page, files, expected = Array.isArray(files) ? files.length : 1) {
+  const rows = page.locator(".upload-row");
+  await expect.poll(async () => {
+    const count = await rows.count();
+    if (count === 0) await page.locator("#file-input").setInputFiles(files);
+    return rows.count();
+  }).toBe(expected);
+}
+
 test("HTTP-compatible UUID fallback initializes the page and honors room query", async ({ page }) => {
   await page.addInitScript(() => {
     Object.defineProperty(Crypto.prototype, "randomUUID", { value: undefined, configurable: true });
@@ -54,9 +63,9 @@ test("plain room preserves multiline text and updates another client", async ({ 
   await expect(second.locator(".item-content")).toHaveText(exact);
   await expect(second.locator(".item-alias")).toHaveText("Вася");
   await expect(second.locator("#item-form")).toBeVisible();
-  await expect(second.locator(".delete")).toHaveCount(1);
+  await expect(second.locator(".item .delete")).toHaveCount(1);
   await expect(second.getByText("В сети")).toBeVisible();
-  await second.locator(".delete").click();
+  await second.locator(".item .delete").click();
   await expect(page.locator(".item")).toHaveCount(0);
   await secondContext.close();
 });
@@ -96,11 +105,10 @@ test("text and multiple files are sent as one entry only after Add", async ({ pa
   await expect(page.locator("#file-input")).toBeEnabled();
   const content = Buffer.from("first line\nsecond line\n", "utf8");
   const secondContent = Buffer.from("another attachment", "utf8");
-  await page.locator("#file-input").setInputFiles([
+  await selectFiles(page, [
     { name: "script $HOME.txt", mimeType: "text/plain", buffer: content },
     { name: "notes.txt", mimeType: "text/plain", buffer: secondContent }
   ]);
-  await expect(page.locator(".upload-row")).toHaveCount(2);
   await expect(page.locator(".upload-row .muted")).toHaveText(["Готов к отправке", "Готов к отправке"]);
   const beforeAdd = await (await request.get(`/api/rooms/${room}`)).json();
   expect(beforeAdd.items).toHaveLength(0);
@@ -119,11 +127,11 @@ test("text and multiple files are sent as one entry only after Add", async ({ pa
   const downloaded = await request.get(`/api/rooms/${room}/files/${firstFile.id}`);
   expect(await downloaded.body()).toEqual(content);
 
-  const popupPromise = page.waitForEvent("popup");
-  await page.locator(".file-attachment").filter({ hasText:"script $HOME.txt" }).getByRole("link", { name:"Открыть" }).click();
-  const preview = await popupPromise;
-  await expect(preview.locator("body")).toContainText("first line");
-  await preview.close();
+  await page.locator(".file-attachment").filter({ hasText:"script $HOME.txt" }).getByRole("button", { name:"Открыть" }).click();
+  await expect(page.locator("#preview-dialog")).toBeVisible();
+  await expect(page.locator("#preview-title")).toHaveText("script $HOME.txt");
+  await expect(page.locator("#preview-content")).toContainText("first line");
+  await page.locator("#preview-dialog").getByRole("button", { name:"Закрыть" }).click();
 
   const participant = await page.context().newPage();
   await participant.goto(`/r/${room}`);
@@ -137,6 +145,7 @@ test("text and multiple files are sent as one entry only after Add", async ({ pa
 test("interrupted upload resumes after reload and verifies completed chunks", async ({ page, request }) => {
   const room = `resume-${crypto.randomUUID()}`;
   const content = Buffer.alloc((1 << 20) + 19, 0x5a);
+  await page.addInitScript(() => Object.defineProperty(Navigator.prototype, "serviceWorker", { configurable:true, get:() => undefined }));
   await page.goto("/");
   await page.locator("#room-id").fill(room);
   await page.getByRole("button", { name:"Создать комнату" }).click();
@@ -148,12 +157,12 @@ test("interrupted upload resumes after reload and verifies completed chunks", as
   });
   const selected = { name:"resume.bin", mimeType:"application/octet-stream", buffer:content };
   await expect(page.locator("#file-input")).toBeEnabled();
-  await page.locator("#file-input").setInputFiles(selected);
+  await selectFiles(page, selected);
   await page.getByRole("button", { name:"Добавить", exact:true }).click();
   await expect(page.locator(".upload-row .muted")).toContainText("Ошибка");
   await page.reload();
   await expect(page.locator("#file-input")).toBeEnabled();
-  await page.locator("#file-input").setInputFiles(selected);
+  await selectFiles(page, selected);
   await page.getByRole("button", { name:"Добавить", exact:true }).click();
   await expect(page.locator(".file-attachment .file-name")).toHaveText("resume.bin");
   const data = await (await request.get(`/api/rooms/${room}`)).json();
@@ -180,7 +189,7 @@ test("encrypted room keeps plaintext out of the server response", async ({ page,
   await page.locator("#alias").fill(secretAlias);
   await page.locator("#item-text").fill(secret);
   const fileSecret = Buffer.from("private file bytes\n", "utf8");
-  await page.locator("#file-input").setInputFiles({ name:"private.txt", mimeType:"text/plain", buffer:fileSecret });
+  await selectFiles(page, { name:"private.txt", mimeType:"text/plain", buffer:fileSecret });
   await expect(page.locator(".upload-row .muted")).toHaveText("Готов к отправке");
   await page.getByRole("button", { name: "Добавить", exact: true }).click();
   await expect(page.locator(".item-content")).toHaveText(secret);
@@ -230,6 +239,7 @@ test("encrypted room keeps plaintext out of the server response", async ({ page,
 test("encrypted upload resumes without retransmitting a verified chunk", async ({ page }) => {
   const room = `encrypted-resume-${crypto.randomUUID()}`;
   const content = Buffer.alloc((1 << 20) + 23, 0x31);
+  await page.addInitScript(() => Object.defineProperty(Navigator.prototype, "serviceWorker", { configurable:true, get:() => undefined }));
   await page.goto("/");
   await page.locator("#room-id").fill(room);
   await page.locator("#encrypted").check();
@@ -242,12 +252,12 @@ test("encrypted upload resumes without retransmitting a verified chunk", async (
   });
   const selected = { name:"encrypted-resume.bin", mimeType:"application/octet-stream", buffer:content };
   await expect(page.locator("#file-input")).toBeEnabled();
-  await page.locator("#file-input").setInputFiles(selected);
+  await selectFiles(page, selected);
   await page.getByRole("button", { name:"Добавить", exact:true }).click();
   await expect(page.locator(".upload-row .muted")).toContainText("Ошибка");
   await page.reload();
   await expect(page.locator("#file-input")).toBeEnabled();
-  await page.locator("#file-input").setInputFiles(selected);
+  await selectFiles(page, selected);
   await page.getByRole("button", { name:"Добавить", exact:true }).click();
   await expect(page.locator(".file-attachment .file-name")).toHaveText("encrypted-resume.bin");
 });
@@ -262,6 +272,7 @@ test("encrypted room can be unlocked with separately shared passphrase", async (
   await page.getByRole("button", { name: "Создать комнату" }).click();
   await page.locator("#item-text").fill("exact secret");
   await page.getByRole("button", { name: "Добавить", exact: true }).click();
+  await expect(page.locator(".item-content")).toHaveText("exact secret");
 
   const readerContext = await browser.newContext();
   const reader = await readerContext.newPage();
@@ -273,12 +284,50 @@ test("encrypted room can be unlocked with separately shared passphrase", async (
   await readerContext.close();
 });
 
+test("clipboard, search, pin, favorite and clear stay client-safe", async ({ page, request }) => {
+  const room = `productivity-${crypto.randomUUID()}`;
+  await page.addInitScript(() => Object.defineProperty(Navigator.prototype, "clipboard", { configurable:true, get:() => ({
+    read: async () => [{ types:["text/plain"], getType: async () => new Blob(["from clipboard"], { type:"text/plain" }) }]
+  }) }));
+  await page.goto("/");
+  await page.locator("#room-id").fill(room);
+  await page.getByRole("button", { name:"Создать комнату" }).click();
+  await expect(page).toHaveURL(new RegExp(`/r/${room}$`));
+  await page.locator("#read-clipboard").click();
+  await expect(page.locator("#item-text")).toHaveValue("from clipboard");
+  await page.locator("#entry-ttl").selectOption("300");
+  await page.getByRole("button", { name:"Добавить", exact:true }).click();
+  await expect(page.locator(".item")).toHaveCount(1);
+  await page.locator("#item-text").fill("second searchable value");
+  await page.getByRole("button", { name:"Добавить", exact:true }).click();
+  await expect(page.locator(".item")).toHaveCount(2);
+  await page.locator("#search").fill("searchable");
+  await expect(page.locator(".item")).toHaveCount(1);
+  await page.locator("#search").fill("");
+  await page.locator(".item").filter({ hasText:"from clipboard" }).getByRole("button", { name:"Закрепить" }).click();
+  await expect.poll(async () => (await (await request.get(`/api/rooms/${room}`)).json()).entries.some(entry => entry.pinned)).toBe(true);
+  await page.locator("#favorite-room").click();
+  await expect(page.locator("#favorite-room")).toContainText("В избранном");
+  await page.reload();
+  await expect(page.locator("#favorite-room")).toContainText("В избранном");
+  const data = await (await request.get(`/api/rooms/${room}`)).json();
+  expect(data.entries.some(entry => entry.pinned)).toBe(true);
+  expect(data.entries.some(entry => entry.expiresAt)).toBe(true);
+  page.once("dialog", dialog => dialog.accept());
+  await page.locator("#clear-room").click();
+  await expect(page.locator(".item")).toHaveCount(0);
+});
+
 test("mobile layout can create a room and show QR", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "android-chrome", "mobile-specific scenario");
   const room = `mobile-${crypto.randomUUID()}`;
   await page.goto("/");
   await page.locator("#room-id").fill(room);
   await page.getByRole("button", { name: "Создать комнату" }).click();
+  await expect(page).toHaveURL(new RegExp(`/r/${room}$`));
+  await page.locator("#item-text").fill("mobile smoke");
+  await page.getByRole("button", { name:"Добавить", exact:true }).click();
+  await expect(page.locator(".item-content")).toHaveText("mobile smoke");
   await page.getByRole("button", { name: "Поделиться" }).click();
   await expect(page.locator("#share-dialog")).toBeVisible();
   await expect(page.locator("#qr canvas:visible, #qr img:visible")).toBeVisible();

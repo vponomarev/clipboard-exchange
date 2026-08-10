@@ -19,6 +19,10 @@ SQLite и весь интерфейс встроены в один бинарн�
 - опциональное client-side шифрование AES-256-GCM;
 - HTTP, встроенный HTTPS или работа за nginx/HAProxy;
 - SQLite/WAL, TTL комнат и эксплуатационные лимиты;
+- installable PWA и Android Web Share Target, локальные recent/favorite rooms;
+- поиск, фильтры, закрепление, уведомления, TTL записей и download-once;
+- атомарная публикация текста и всех файлов одним сообщением;
+- Prometheus metrics и CLI для status/rooms/backup/restore/reconcile;
 - single binary для Linux amd64 без CGO.
 
 Для файлов действует отдельная квота комнаты 500 МиБ. Открытые файлы сохраняют
@@ -114,20 +118,35 @@ sudo /usr/local/bin/clipboard-exchange deinstall --purge
 ### Backup и restore
 
 SQLite metadata и каталог `files` образуют одну согласованную копию. Для простого
-offline backup остановите сервис и архивируйте весь data directory вместе с
-конфигурацией:
+offline backup остановите сервис и используйте встроенную команду:
 
 ```bash
 sudo systemctl stop clipboard-exchange
-sudo tar -C / -czf clipboard-exchange-backup.tar.gz \
-  var/lib/clipboard-exchange etc/clipboard-exchange
+sudo clipboard-exchange backup \
+  --database=/var/lib/clipboard-exchange/data.db \
+  --files-dir=/var/lib/clipboard-exchange/files \
+  --output=/srv/backup/clipboard-exchange.tar.gz
 sudo systemctl start clipboard-exchange
 ```
 
-Restore выполняется при остановленном сервисе в пустые каталоги из того же архива;
-не восстанавливайте SQLite и `files` из разных моментов времени. После restore
-запустите сервис и проверьте `/readyz`; startup reconciliation удалит только
-незарегистрированные временные chunks и orphan objects.
+Restore требует остановленного сервиса и явного подтверждения замены данных:
+
+```bash
+sudo systemctl stop clipboard-exchange
+sudo clipboard-exchange restore \
+  --database=/var/lib/clipboard-exchange/data.db \
+  --files-dir=/var/lib/clipboard-exchange/files \
+  --input=/srv/backup/clipboard-exchange.tar.gz --force
+sudo systemctl start clipboard-exchange
+curl -f http://127.0.0.1:8080/readyz
+```
+
+Операционные команды: `status [--json]`, `rooms list`, `rooms purge ROOM` и
+`storage reconcile`. Prometheus scrape endpoint — `GET /metrics`; он публикует
+только агрегированные счётчики и не содержит room ID, alias, имён или содержимого.
+
+PWA install, Web Share Target, чтение clipboard и notifications доступны браузеру
+только в secure context: используйте HTTPS (либо localhost при локальной проверке).
 
 ## Reverse proxy
 
