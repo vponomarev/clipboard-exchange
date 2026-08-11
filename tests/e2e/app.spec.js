@@ -27,6 +27,18 @@ test("HTTP-compatible UUID fallback initializes the page and honors room query",
   await expect(page).toHaveURL(new RegExp(`/r/${room}$`));
 });
 
+test("mobile layout version dialog shows shell and server versions and checks for updates", async ({ page }) => {
+  await page.goto("/");
+  await page.locator("#app-info").click();
+  await expect(page.locator("#version-dialog")).toBeVisible();
+  await expect(page.locator("#shell-version")).toHaveText("dev");
+  await expect(page.locator("#server-version")).toHaveText("dev");
+  await expect(page.locator("#update-status")).toContainText("актуальная версия");
+  await page.locator("#check-update").click();
+  await expect(page.locator("#check-update")).toBeEnabled();
+  await expect(page.locator("#update-status")).toContainText(/актуальная версия|Новая версия загружена/);
+});
+
 test("protected room exposes separate read-only and read-write links", async ({ page, browser }) => {
   const room = `protected-${crypto.randomUUID()}`;
   await page.goto("/");
@@ -51,6 +63,47 @@ test("protected room exposes separate read-only and read-write links", async ({ 
   await page.getByText("R/W", { exact: true }).click();
   await expect(page.locator("#share-url")).toHaveValue(/write=cw1_/);
   await readerContext.close();
+});
+
+test("mobile layout protected short link opens with PIN once without exposing room URL", async ({ page, request }) => {
+  const room = `short-${crypto.randomUUID()}`;
+  await page.goto("/");
+  await page.locator("#room-id").fill(room);
+  await page.locator("#write-protected").check();
+  await page.locator("#encrypted").check();
+  await page.getByRole("button", { name: "Создать комнату" }).click();
+  await expect(page).toHaveURL(new RegExp(`/r/${room}#`));
+
+  await page.getByRole("button", { name: "Поделиться" }).click();
+  const fullURL = await page.locator("#share-url").inputValue();
+  expect(fullURL).toContain("#key=ce1_");
+  await page.locator(".short-create summary").click();
+  await page.locator("#short-pin").fill("4827");
+  await page.locator("#create-short-link").click();
+  await expect(page.locator("#short-result")).toBeVisible();
+  const shortURL = await page.locator("#short-url").inputValue();
+  expect(shortURL).toMatch(/\/s\/[23456789ABCDEFGHJKMNPQRSTVWXYZ]{5}$/);
+  await expect(page.locator("#short-result-pin")).toHaveText("4827");
+
+  const code = shortURL.split("/").pop();
+  const envelope = await (await request.get(`/api/short-links/${code}`)).text();
+  expect(envelope).not.toContain(room);
+  expect(envelope).not.toContain("4827");
+  expect(envelope).not.toContain(new URL(fullURL).hash);
+
+  await page.goto(shortURL);
+  await expect(page.locator("#short-open-code")).toHaveValue(code);
+  await page.locator("#short-open-pin").fill("0000");
+  await page.getByRole("button", { name: "Открыть комнату" }).click();
+  await expect(page.locator("#short-open-error")).toContainText("PIN неверен");
+  await page.locator("#short-open-pin").fill("4827");
+  await page.getByRole("button", { name: "Открыть комнату" }).click();
+  await expect(page).toHaveURL(new RegExp(`/r/${room}#.*key=ce1_`));
+
+  await page.goto(shortURL);
+  await page.locator("#short-open-pin").fill("4827");
+  await page.getByRole("button", { name: "Открыть комнату" }).click();
+  await expect(page.locator("#short-open-error")).toContainText("Ссылка недоступна");
 });
 
 test("plain room preserves multiline text and updates another client", async ({ page, browser }) => {

@@ -128,6 +128,7 @@ client-side расшифрование и очистка storage.
 - clipboard paste/read для текста, изображений и файлов;
 - client-side поиск, фильтры, pins и unread navigation;
 - recent/favorite rooms и явное безопасное запоминание ключей;
+- короткие защищённые ссылки с PIN, TTL и одноразовым redemption;
 - атомарная публикация текста с группой файлов;
 - TTL комнат/записей, clear room и best-effort download-once;
 - расширенный passive preview без выполнения active content;

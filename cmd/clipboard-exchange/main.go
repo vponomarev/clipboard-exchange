@@ -68,7 +68,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	handler := httpserver.New(cfg, db, files, log.Default())
+	handler := httpserver.NewWithVersion(cfg, db, files, log.Default(), version)
 	httpServer := &http.Server{
 		Addr:              cfg.Listen,
 		Handler:           handler,
@@ -111,6 +111,9 @@ func main() {
 
 func runUploadCleanup(ctx context.Context, db *store.Store, files *filestore.Store, roomTTL time.Duration, warningBytes int64) {
 	cleanup := func() {
+		if _, err := db.DeleteExpiredShortLinks(ctx, time.Now()); err != nil {
+			log.Printf("cleanup expired short links: %v", err)
+		}
 		if _, err := db.DeleteExpiredRooms(ctx, time.Now(), roomTTL); err != nil {
 			log.Printf("cleanup expired rooms: %v", err)
 		}

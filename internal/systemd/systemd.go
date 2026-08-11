@@ -246,6 +246,8 @@ func environmentFile(cfg config.Config) string {
 		{"CLIPBOARD_EXCHANGE_MAX_ITEMS_PER_ROOM", strconv.Itoa(cfg.MaxItemsPerRoom)},
 		{"CLIPBOARD_EXCHANGE_MAX_ROOMS", strconv.Itoa(cfg.MaxRooms)},
 		{"CLIPBOARD_EXCHANGE_RATE_LIMIT", strconv.Itoa(cfg.RateLimit)},
+		{"CLIPBOARD_EXCHANGE_SHORT_LINK_RATE_LIMIT", strconv.Itoa(cfg.ShortLinkRateLimit)},
+		{"CLIPBOARD_EXCHANGE_MAX_SHORT_LINKS", strconv.Itoa(cfg.MaxShortLinks)},
 		{"CLIPBOARD_EXCHANGE_TRUST_PROXY", strconv.FormatBool(cfg.TrustProxy)},
 		{"CLIPBOARD_EXCHANGE_FILES_DIR", cfg.FilesDir},
 		{"CLIPBOARD_EXCHANGE_MAX_FILE_BYTES", strconv.FormatInt(cfg.MaxFileBytes, 10)},
@@ -270,6 +272,8 @@ func addFileStorageEnvironment() error {
 	cfg := config.Default()
 	cfg.FilesDir = filepath.Join(dataDir, "files")
 	values := [][2]string{
+		{"CLIPBOARD_EXCHANGE_SHORT_LINK_RATE_LIMIT", strconv.Itoa(cfg.ShortLinkRateLimit)},
+		{"CLIPBOARD_EXCHANGE_MAX_SHORT_LINKS", strconv.Itoa(cfg.MaxShortLinks)},
 		{"CLIPBOARD_EXCHANGE_FILES_DIR", cfg.FilesDir},
 		{"CLIPBOARD_EXCHANGE_MAX_FILE_BYTES", strconv.FormatInt(cfg.MaxFileBytes, 10)},
 		{"CLIPBOARD_EXCHANGE_MAX_ROOM_FILE_BYTES", strconv.FormatInt(cfg.MaxRoomFileBytes, 10)},

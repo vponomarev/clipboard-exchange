@@ -2,8 +2,8 @@
 
 const downloads = new Map();
 const encoder = new TextEncoder();
-const appCache = "clipboard-exchange-shell-v7";
-const shell = ["/", "/assets/style.css?v=12", "/assets/app.js?v=15", "/assets/qrcode.min.js", "/assets/manifest.webmanifest?v=2", "/assets/icon.svg", "/assets/icon-192.png", "/assets/icon-512.png"];
+const appCache = "clipboard-exchange-shell-v9";
+const shell = ["/", "/assets/style.css?v=14", "/assets/app.js?v=17", "/assets/qrcode.min.js", "/assets/manifest.webmanifest?v=2", "/assets/icon.svg", "/assets/icon-192.png", "/assets/icon-512.png"];
 
 self.addEventListener("install", (event) => event.waitUntil(caches.open(appCache).then(cache => cache.addAll(shell)).then(() => self.skipWaiting())));
 self.addEventListener("activate", (event) => event.waitUntil(Promise.all([caches.keys().then(keys => Promise.all(keys.filter(key => key !== appCache).map(key => caches.delete(key)))), self.clients.claim()])));

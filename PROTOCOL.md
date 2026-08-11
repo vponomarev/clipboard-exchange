@@ -1,7 +1,41 @@
-# Clipboard Exchange protocol v5
+# Clipboard Exchange protocol v6
 
 `GET /api/capabilities` — источник negotiated limits и поддержанных версий.
 Клиент не должен считать настроечные значения сервера равными defaults.
+
+## Protected short links v1
+
+Короткая ссылка `/s/{code}` содержит 4–6 символов из алфавита без неоднозначных
+`0/O/1/I/L`. Полный same-origin URL `/r/{room}#...` никогда не отправляется
+серверу открытым текстом. Клиент дополняет JSON
+`{"target":"...","redemptionToken":"..."}` случайными байтами до 512 байт и
+шифрует AES-256-GCM со случайными 96-bit IV и 128-bit salt. Ключ получается из
+четырёхзначного PIN через PBKDF2-SHA-256, 600 000 итераций. AAD:
+
+```text
+clipboard-exchange-short-link:v1
+```
+
+API:
+
+```text
+POST /api/short-links
+GET  /api/short-links/{code}
+POST /api/short-links/{code}/redeem
+```
+
+Первый запрос передаёт только encrypted envelope, hex SHA-256 случайного
+redemption-token, TTL, `maxUses` и желаемую длину кода. `GET` ничего не расходует
+и возвращает envelope фиксированного размера; для отсутствующего, истёкшего или
+использованного кода возвращается синтетический envelope той же формы. После
+успешной локальной расшифровки клиент предъявляет 32-byte redemption token.
+Сервер сравнивает его SHA-256 и атомарно увеличивает `useCount`. Поэтому неверный
+PIN и HTTP-prefetch не могут погасить одноразовую ссылку.
+
+`maxUses=1` означает одноразовый режим, `maxUses=0` — использование до TTL.
+Четырёхсимвольный код разрешён только с `maxUses=1` и TTL не более 600 секунд.
+Максимальный TTL — семь дней. Ответы и HTML имеют `Cache-Control: no-store` и
+глобальную `Referrer-Policy: no-referrer`.
 
 ## Atomic entries v5
 

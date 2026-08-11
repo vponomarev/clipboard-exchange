@@ -82,6 +82,91 @@ func TestOpenWriteRoomDoesNotUseCapability(t *testing.T) {
 	}
 }
 
+func TestShortLinkRedemptionIsAtomicAndSecretBound(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	link := ShortLink{Code: "K7M2P", Ciphertext: "ciphertext", IV: "iv", Salt: "salt", TokenHash: "correct", KDFIterations: 600000, MaxUses: 1, ExpiresAt: time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano)}
+	if err := s.CreateShortLink(ctx, link, 10); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RedeemShortLink(ctx, link.Code, "wrong"); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("wrong redemption secret: %v", err)
+	}
+	if _, err := s.GetShortLink(ctx, link.Code); err != nil {
+		t.Fatalf("wrong secret consumed link: %v", err)
+	}
+	if err := s.RedeemShortLink(ctx, link.Code, link.TokenHash); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.GetShortLink(ctx, link.Code); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("one-time link remains available: %v", err)
+	}
+	if err := s.RedeemShortLink(ctx, link.Code, link.TokenHash); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("second redemption succeeded: %v", err)
+	}
+}
+
+func TestExpiredShortLinksAreRemoved(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	link := ShortLink{Code: "OLD22", Ciphertext: "ciphertext", IV: "iv", Salt: "salt", TokenHash: "token", KDFIterations: 600000, MaxUses: 0, ExpiresAt: time.Now().UTC().Add(-time.Minute).Format(time.RFC3339Nano)}
+	if err := s.CreateShortLink(ctx, link, 10); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.GetShortLink(ctx, link.Code); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expired link is visible: %v", err)
+	}
+	if count, err := s.DeleteExpiredShortLinks(ctx, time.Now()); err != nil || count != 1 {
+		t.Fatalf("cleanup count=%d err=%v", count, err)
+	}
+}
+
+func TestMultiUseShortLinkRemainsUntilTTL(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	link := ShortLink{Code: "MANY2", Ciphertext: "ciphertext", IV: "iv", Salt: "salt", TokenHash: "correct", KDFIterations: 600000, MaxUses: 0, ExpiresAt: time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano)}
+	if err := s.CreateShortLink(ctx, link, 10); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if err := s.RedeemShortLink(ctx, link.Code, link.TokenHash); err != nil {
+			t.Fatalf("redemption %d: %v", i+1, err)
+		}
+	}
+	if got, err := s.GetShortLink(ctx, link.Code); err != nil || got.UseCount != 2 {
+		t.Fatalf("multi-use link: %#v err=%v", got, err)
+	}
+}
+
+func TestVersionFiveDatabaseAddsShortLinks(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "v5.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`PRAGMA user_version=5`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	var version, tables int
+	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='short_links'`).Scan(&tables); err != nil {
+		t.Fatal(err)
+	}
+	if version != 6 || tables != 1 {
+		t.Fatalf("version=%d short_links=%d", version, tables)
+	}
+}
+
 func TestVersionTwoRoomsMigrateAsWriteProtected(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "v2.db")
 	db, err := sql.Open("sqlite", path)

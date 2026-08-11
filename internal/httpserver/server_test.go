@@ -5,8 +5,10 @@ import (
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -26,6 +28,10 @@ import (
 const testWriteToken = "cw1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
 func testServer(t *testing.T) *httptest.Server {
+	return testServerWithVersion(t, "dev")
+}
+
+func testServerWithVersion(t *testing.T, version string) *httptest.Server {
 	t.Helper()
 	db, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
@@ -38,7 +44,7 @@ func testServer(t *testing.T) *httptest.Server {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ts := httptest.NewServer(New(cfg, db, files, log.New(io.Discard, "", 0)))
+	ts := httptest.NewServer(NewWithVersion(cfg, db, files, log.New(io.Discard, "", 0), version))
 	t.Cleanup(ts.Close)
 	return ts
 }
@@ -141,6 +147,87 @@ func TestRoomCRUDPreservesTextAndSecurityHeaders(t *testing.T) {
 		t.Fatalf("delete: %s", resp.Status)
 	}
 	resp.Body.Close()
+}
+
+func TestShortLinkEnvelopeAndOneTimeRedemption(t *testing.T) {
+	ts := testServer(t)
+	client := ts.Client()
+	ciphertext := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{7}, shortLinkCipherBytes))
+	iv := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{8}, 12))
+	salt := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{9}, 16))
+	token := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{10}, 32))
+	digest := sha256.Sum256([]byte(token))
+	resp := requestJSON(t, client, http.MethodPost, ts.URL+"/api/short-links", map[string]any{"ciphertext": ciphertext, "iv": iv, "salt": salt, "tokenHash": fmt.Sprintf("%x", digest[:]), "kdfIterations": shortLinkKDFIterations, "expiresInSeconds": 3600, "maxUses": 1, "codeLength": 5})
+	if resp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("create short link: %s %s", resp.Status, body)
+	}
+	var created struct {
+		Code string `json:"code"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&created); err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if !shortCodePattern.MatchString(created.Code) || len(created.Code) != 5 {
+		t.Fatalf("invalid generated code %q", created.Code)
+	}
+	getEnvelope := func() map[string]any {
+		resp, err := client.Get(ts.URL + "/api/short-links/" + strings.ToLower(created.Code))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK || resp.Header.Get("Cache-Control") != "no-store" {
+			t.Fatalf("get envelope: %s cache=%q", resp.Status, resp.Header.Get("Cache-Control"))
+		}
+		var envelope map[string]any
+		if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
+			t.Fatal(err)
+		}
+		return envelope
+	}
+	if got := getEnvelope(); got["ciphertext"] != ciphertext || got["tokenHash"] != nil {
+		t.Fatalf("server exposed wrong envelope: %#v", got)
+	}
+	wrongToken := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{11}, 32))
+	resp = requestJSON(t, client, http.MethodPost, ts.URL+"/api/short-links/"+created.Code+"/redeem", map[string]string{"redemptionToken": wrongToken})
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("wrong redemption: %s", resp.Status)
+	}
+	resp.Body.Close()
+	if got := getEnvelope(); got["ciphertext"] != ciphertext {
+		t.Fatal("wrong token consumed the link")
+	}
+	resp = requestJSON(t, client, http.MethodPost, ts.URL+"/api/short-links/"+created.Code+"/redeem", map[string]string{"redemptionToken": token})
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("redeem: %s", resp.Status)
+	}
+	resp.Body.Close()
+	if got := getEnvelope(); got["ciphertext"] == ciphertext || len(got["ciphertext"].(string)) != len(ciphertext) {
+		t.Fatalf("consumed link response is distinguishable by shape: %#v", got)
+	}
+	resp, err := client.Get(ts.URL + "/s/" + strings.ToLower(created.Code))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("short-link page: %s", resp.Status)
+	}
+	if resp.Header.Get("Cache-Control") != "no-store" || !strings.Contains(resp.Header.Get("X-Robots-Tag"), "noindex") {
+		t.Fatalf("short-link page privacy headers: cache=%q robots=%q", resp.Header.Get("Cache-Control"), resp.Header.Get("X-Robots-Tag"))
+	}
+}
+
+func TestFourCharacterShortLinkRequiresOneTimeTenMinutes(t *testing.T) {
+	ts := testServer(t)
+	request := map[string]any{"ciphertext": base64.RawURLEncoding.EncodeToString(make([]byte, shortLinkCipherBytes)), "iv": base64.RawURLEncoding.EncodeToString(make([]byte, 12)), "salt": base64.RawURLEncoding.EncodeToString(make([]byte, 16)), "tokenHash": strings.Repeat("a", 64), "kdfIterations": shortLinkKDFIterations, "expiresInSeconds": 3600, "maxUses": 0, "codeLength": 4}
+	resp := requestJSON(t, ts.Client(), http.MethodPost, ts.URL+"/api/short-links", request)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("unsafe four-character link accepted: %s", resp.Status)
+	}
 }
 
 func TestRealtimeNotification(t *testing.T) {
@@ -253,8 +340,11 @@ func TestCapabilitiesAndAliasLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
-	if capabilities["protocolVersion"] != float64(5) || capabilities["writeCapabilities"] != true || capabilities["openWriteRooms"] != true || capabilities["groupedAttachments"] != true || capabilities["inlineFiles"] != true || capabilities["aliases"] != true || capabilities["atomicEntries"] != true || capabilities["entryTTL"] != true || capabilities["roomTTL"] != true || capabilities["pwa"] != true || capabilities["qrScanner"] != true {
+	if capabilities["serverVersion"] != "dev" || capabilities["protocolVersion"] != float64(6) || capabilities["writeCapabilities"] != true || capabilities["openWriteRooms"] != true || capabilities["groupedAttachments"] != true || capabilities["inlineFiles"] != true || capabilities["aliases"] != true || capabilities["atomicEntries"] != true || capabilities["entryTTL"] != true || capabilities["roomTTL"] != true || capabilities["pwa"] != true || capabilities["qrScanner"] != true || capabilities["shortLinks"] != true || capabilities["shortLinkKDFIterations"] != float64(shortLinkKDFIterations) {
 		t.Fatalf("unexpected capabilities: %#v", capabilities)
+	}
+	if got := resp.Header.Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("capabilities must not be cached: %q", got)
 	}
 
 	resp = requestJSON(t, client, "POST", ts.URL+"/api/rooms", map[string]any{"id": "alias", "encrypted": false, "keyId": "", "writeToken": testWriteToken})
@@ -333,7 +423,7 @@ func TestAtomicTextEntryPinClearMetricsAndPWA(t *testing.T) {
 	if resp.StatusCode != http.StatusOK || !bytes.Contains(metrics, []byte("clipboard_exchange_rooms 1")) || bytes.Contains(metrics, []byte("exact")) {
 		t.Fatalf("unsafe or incomplete metrics: %s", metrics)
 	}
-	for _, asset := range []string{"/assets/manifest.webmanifest?v=2", "/assets/download-sw.js?v=9", "/assets/icon-192.png", "/assets/icon-512.png"} {
+	for _, asset := range []string{"/assets/manifest.webmanifest?v=2", "/assets/download-sw.js?v=11", "/assets/icon-192.png", "/assets/icon-512.png"} {
 		response, err := client.Get(ts.URL + asset)
 		if err != nil {
 			t.Fatal(err)
@@ -625,7 +715,7 @@ func TestRejectsPlaintextInEncryptedRoom(t *testing.T) {
 }
 
 func TestServesEmbeddedApplication(t *testing.T) {
-	ts := testServer(t)
+	ts := testServerWithVersion(t, "v-test")
 	for _, path := range []string{"/", "/assets/app.js", "/assets/style.css", "/assets/qrcode.min.js"} {
 		resp, err := ts.Client().Get(ts.URL + path)
 		if err != nil {
@@ -646,14 +736,17 @@ func TestServesEmbeddedApplication(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Contains(body, []byte(`/assets/app.js?v=15`)) {
+	if !bytes.Contains(body, []byte(`/assets/app.js?v=17`)) {
 		t.Fatal("page does not cache-bust app.js")
 	}
-	if !bytes.Contains(body, []byte(`/assets/style.css?v=12`)) {
+	if !bytes.Contains(body, []byte(`/assets/style.css?v=14`)) {
 		t.Fatal("page does not cache-bust style.css")
 	}
+	if !bytes.Contains(body, []byte(`name="clipboard-exchange-version" content="v-test"`)) || bytes.Contains(body, []byte("__CLIPBOARD_EXCHANGE_VERSION__")) {
+		t.Fatal("page does not expose the embedded shell version")
+	}
 
-	resp, err = ts.Client().Get(ts.URL + "/assets/app.js?v=15")
+	resp, err = ts.Client().Get(ts.URL + "/assets/app.js?v=17")
 	if err != nil {
 		t.Fatal(err)
 	}

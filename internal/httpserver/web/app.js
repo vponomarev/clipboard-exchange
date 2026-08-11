@@ -2,11 +2,16 @@
   "use strict";
 
   const $ = (id) => document.getElementById(id);
+  const shellVersion = document.querySelector('meta[name="clipboard-exchange-version"]')?.content || "unknown";
   const roomMatch = location.pathname.match(/^\/r\/([A-Za-z0-9][A-Za-z0-9_-]{0,63})$/);
+  const shortMatch = location.pathname.match(/^\/s\/([23456789ABCDEFGHJKMNPQRSTVWXYZ]{4,6})$/i);
   const fragment = new URLSearchParams(location.hash.slice(1));
-  const state = { roomID: roomMatch ? roomMatch[1] : "", room: null, key: null, keyText: "", writeToken: fragment.get("write") || "", canWrite: Boolean(fragment.get("write")), entries: [], items: [], files: [], renderedEntries: [], pendingFiles: [], capabilities: null, downloadRegistration: null, socket: null, refreshTimer: 0, previousEntryIDs: new Set(), hasRefreshed: false, unread: 0, previewIndex: 0, installPrompt: null, scanStream: null, scanTimer: 0, scanDetector: null };
+  const state = { roomID: roomMatch ? roomMatch[1] : "", room: null, key: null, keyText: "", writeToken: fragment.get("write") || "", canWrite: Boolean(fragment.get("write")), entries: [], items: [], files: [], renderedEntries: [], pendingFiles: [], capabilities: null, downloadRegistration: null, appRegistration: null, updateReady: false, updateChecking: false, socket: null, refreshTimer: 0, previousEntryIDs: new Set(), hasRefreshed: false, unread: 0, previewIndex: 0, installPrompt: null, scanStream: null, scanTimer: 0, scanDetector: null };
   const encoder = new TextEncoder();
   const decoder = new TextDecoder("utf-8", { fatal: true });
+  const shortLinkAAD = encoder.encode("clipboard-exchange-short-link:v1");
+  const shortLinkPayloadBytes = 512;
+  const shortLinkKDFIterations = 600000;
 
   function b64url(bytes) {
     let binary = "";
@@ -53,6 +58,36 @@
     return new Uint8Array(bits);
   }
   function rawKeyText(bytes) { return "ce1_" + b64url(bytes); }
+
+  async function shortLinkKey(pin, salt, iterations) {
+    const material = await crypto.subtle.importKey("raw", encoder.encode(pin), "PBKDF2", false, ["deriveKey"]);
+    return crypto.subtle.deriveKey({ name:"PBKDF2", salt, iterations, hash:"SHA-256" }, material, { name:"AES-GCM", length:256 }, false, ["encrypt", "decrypt"]);
+  }
+
+  async function encryptShortTarget(target, pin) {
+    const salt = crypto.getRandomValues(new Uint8Array(16));
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const redemptionToken = b64url(crypto.getRandomValues(new Uint8Array(32)));
+    const encoded = encoder.encode(JSON.stringify({ target, redemptionToken }));
+    if (encoded.length > shortLinkPayloadBytes - 2) throw new Error("Ссылка комнаты слишком длинная для сокращения");
+    const padded = crypto.getRandomValues(new Uint8Array(shortLinkPayloadBytes));
+    padded[0] = encoded.length >>> 8; padded[1] = encoded.length & 255; padded.set(encoded, 2);
+    const key = await shortLinkKey(pin, salt, shortLinkKDFIterations);
+    const ciphertext = new Uint8Array(await crypto.subtle.encrypt({ name:"AES-GCM", iv, additionalData:shortLinkAAD, tagLength:128 }, key, padded));
+    return { ciphertext:b64url(ciphertext), iv:b64url(iv), salt:b64url(salt), redemptionToken, tokenHash:await sha256Hex(encoder.encode(redemptionToken)) };
+  }
+
+  async function decryptShortTarget(envelope, pin) {
+    if (envelope?.version !== 1 || envelope.kdfIterations !== shortLinkKDFIterations) throw new Error("Недоступная короткая ссылка или неверный PIN");
+    const key = await shortLinkKey(pin, fromB64url(envelope.salt), envelope.kdfIterations);
+    const padded = new Uint8Array(await crypto.subtle.decrypt({ name:"AES-GCM", iv:fromB64url(envelope.iv), additionalData:shortLinkAAD, tagLength:128 }, key, fromB64url(envelope.ciphertext)));
+    if (padded.length !== shortLinkPayloadBytes) throw new Error("Недоступная короткая ссылка или неверный PIN");
+    const length = padded[0] * 256 + padded[1];
+    if (length < 1 || length > padded.length - 2) throw new Error("Недоступная короткая ссылка или неверный PIN");
+    const payload = JSON.parse(decoder.decode(padded.slice(2, 2 + length)));
+    if (typeof payload.target !== "string" || typeof payload.redemptionToken !== "string" || fromB64url(payload.redemptionToken).length !== 32) throw new Error("Недоступная короткая ссылка или неверный PIN");
+    return { target:scannedRoomTarget(payload.target), redemptionToken:payload.redemptionToken };
+  }
 
   async function api(url, options = {}) {
     const { write = false, ...fetchOptions } = options;
@@ -146,22 +181,36 @@
 
   async function initPWA() {
     updateNetworkState();
-    addEventListener("online", () => { updateNetworkState(); toast("Соединение восстановлено"); });
+    addEventListener("online", () => { updateNetworkState(); toast("Соединение восстановлено"); refreshVersionInfo().catch(() => {}); });
     addEventListener("offline", updateNetworkState);
+    $("app-info").addEventListener("click", () => { renderVersionInfo(); $("version-dialog").showModal(); });
+    $("version-dialog").querySelector(".dialog-close").addEventListener("click", () => $("version-dialog").close());
+    $("check-update").addEventListener("click", checkForUpdate);
     $("scan-qr").addEventListener("click", startQRScanner);
     $("scan-dialog").querySelector(".dialog-close").addEventListener("click", closeQRScanner);
     $("scan-dialog").addEventListener("cancel", stopQRScanner);
     $("scan-dialog").addEventListener("close", stopQRScanner);
     $("scan-link-form").addEventListener("submit", event => { event.preventDefault(); openScannedRoom($("scan-link").value); });
-    $("update-app").addEventListener("click", () => location.reload());
+    $("update-app").addEventListener("click", applyUpdate);
     if (navigator.serviceWorker) {
       let hadController = Boolean(navigator.serviceWorker.controller);
       navigator.serviceWorker.addEventListener("controllerchange", () => {
-        if (hadController) show("update-app");
+        if (hadController) markUpdateReady();
         hadController = true;
       });
-      navigator.serviceWorker.register("/assets/download-sw.js?v=9", { scope:"/" }).catch(() => {});
+      try {
+        state.appRegistration = await navigator.serviceWorker.register("/assets/download-sw.js?v=11", { scope:"/" });
+        observeAppRegistration(state.appRegistration);
+      } catch (_) {}
     }
+    await refreshVersionInfo().catch(() => renderVersionInfo());
+    try {
+      const previousShell = localStorage.getItem("clipboard-exchange:update-from");
+      if (previousShell) {
+        localStorage.removeItem("clipboard-exchange:update-from");
+        if (previousShell !== shellVersion) toast(`Приложение обновлено до ${shellVersion}`);
+      }
+    } catch (_) {}
     addEventListener("beforeinstallprompt", event => { event.preventDefault(); state.installPrompt = event; show("install-app"); });
     $("install-app").addEventListener("click", async () => { if (!state.installPrompt) return; await state.installPrompt.prompt(); state.installPrompt = null; show("install-app", false); });
     const query = new URLSearchParams(location.search);
@@ -175,6 +224,69 @@
 
   function updateNetworkState() {
     show("offline-notice", !navigator.onLine);
+    renderVersionInfo();
+  }
+
+  function observeAppRegistration(registration) {
+    if (registration.waiting) markUpdateReady();
+    registration.addEventListener("updatefound", () => {
+      const worker = registration.installing;
+      const replacingExistingWorker = Boolean(navigator.serviceWorker.controller);
+      if (!worker) return;
+      if (replacingExistingWorker) $("update-status").textContent = "Загружаем новую версию…";
+      worker.addEventListener("statechange", () => {
+        if (worker.state === "activated" && replacingExistingWorker) markUpdateReady();
+      });
+    });
+  }
+
+  function markUpdateReady() {
+    state.updateReady = true;
+    show("update-app");
+    renderVersionInfo("Новая версия загружена. Перезапустите приложение, чтобы применить её.");
+  }
+
+  function renderVersionInfo(statusText = "") {
+    $("shell-version").textContent = shellVersion;
+    const serverVersion = state.capabilities?.serverVersion || "—";
+    $("server-version").textContent = serverVersion;
+    if (statusText) $("update-status").textContent = statusText;
+    else if (!navigator.onLine) $("update-status").textContent = "Проверка обновлений недоступна без сети.";
+    else if (state.updateChecking) $("update-status").textContent = "Проверяем обновление…";
+    else if (state.updateReady) $("update-status").textContent = "Новая версия загружена. Перезапустите приложение, чтобы применить её.";
+    else if (serverVersion !== "—" && serverVersion !== shellVersion) $("update-status").textContent = `На сервере доступна версия ${serverVersion}. Выполняется проверка обновления.`;
+    else $("update-status").textContent = "Установлена актуальная версия.";
+  }
+
+  async function refreshVersionInfo() {
+    const capabilities = await api("/api/capabilities", { cache:"no-store" });
+    state.capabilities = capabilities;
+    renderVersionInfo();
+    return capabilities;
+  }
+
+  async function checkForUpdate() {
+    if (!navigator.onLine) { renderVersionInfo("Подключитесь к сети, чтобы проверить обновление."); return; }
+    state.updateChecking = true; $("check-update").disabled = true; renderVersionInfo();
+    try {
+      await refreshVersionInfo();
+      const registration = state.appRegistration || await navigator.serviceWorker?.getRegistration("/");
+      if (!registration) { renderVersionInfo("Service Worker недоступен. Обновите страницу средствами браузера."); return; }
+      state.appRegistration = registration;
+      await registration.update();
+      if (registration.waiting) markUpdateReady();
+      else if (!state.updateReady && state.capabilities?.serverVersion === shellVersion) renderVersionInfo("Установлена актуальная версия.");
+      else if (!state.updateReady) renderVersionInfo(`Найдена версия ${state.capabilities?.serverVersion || "новее текущей"}. Chrome завершает загрузку…`);
+    } catch (error) {
+      renderVersionInfo(`Не удалось проверить обновление: ${error.message}`);
+    } finally {
+      state.updateChecking = false; $("check-update").disabled = false;
+    }
+  }
+
+  function applyUpdate() {
+    try { localStorage.setItem("clipboard-exchange:update-from", shellVersion); } catch (_) {}
+    location.reload();
   }
 
   async function startQRScanner() {
@@ -284,6 +396,30 @@
 	renderRecentRooms();
   }
 
+  function initShortLink() {
+    const code = shortMatch[1].toUpperCase();
+    show("short-link");
+    $("short-open-code").value = code;
+    $("short-open-form").addEventListener("submit", async (event) => {
+      event.preventDefault(); message("short-open-error", "");
+      const pin = $("short-open-pin").value;
+      const submit = $("short-open-submit");
+      if (!/^\d{4}$/.test(pin)) { message("short-open-error", "Введите PIN из четырёх цифр"); return; }
+      if (!globalThis.crypto?.subtle) { message("short-open-error", "Открытие защищённой ссылки требует HTTPS или localhost"); return; }
+      submit.disabled = true;
+      try {
+        const envelope = await api(`/api/short-links/${code}`, { cache:"no-store" });
+        const payload = await decryptShortTarget(envelope, pin);
+        await api(`/api/short-links/${code}/redeem`, { method:"POST", body:JSON.stringify({ redemptionToken:payload.redemptionToken }) });
+        location.assign(payload.target);
+      } catch (_) {
+        message("short-open-error", "Ссылка недоступна, просрочена или PIN неверен");
+        submit.disabled = false;
+        $("short-open-pin").select();
+      }
+    });
+  }
+
   async function createRoom(event) {
     event.preventDefault(); message("create-error", "");
     const submit = event.submitter; submit.disabled = true;
@@ -311,16 +447,24 @@
 
   async function initRoom() {
     show("room"); $("room-name").textContent = state.roomID; $("room-name").title = state.roomID;
+	$("item-text").disabled = true;
+	$("send").disabled = true;
+	$("file-input").disabled = true;
+	$("share").disabled = true;
 	$("alias").value = loadAlias();
 	const remembered = await loadRememberedSecrets();
 	$("remember-room").checked = remembered;
-    $("file-input").disabled = true;
     $("share").addEventListener("click", openShare);
     $("item-form").addEventListener("submit", addItem);
     $("items").addEventListener("click", itemAction);
     $("key-form").addEventListener("submit", unlockFromDialog);
     $("toggle-unlock-key").addEventListener("click", (e) => togglePassword("unlock-key", e.currentTarget));
     $("copy-link").addEventListener("click", async () => { await copyText($("share-url").value); toast("Ссылка скопирована"); });
+    $("generate-short-pin").addEventListener("click", () => { $("short-pin").value = randomPIN(); });
+    $("create-short-link").addEventListener("click", createShortLink);
+    $("copy-short-link").addEventListener("click", async () => { await copyText($("short-url").value); toast("Короткая ссылка скопирована"); });
+    $("short-code-length").addEventListener("change", () => { if ($("short-code-length").value === "4") { $("short-ttl").value = "600"; $("short-one-time").checked = true; } });
+    $("short-one-time").addEventListener("change", () => { if (!$("short-one-time").checked && $("short-code-length").value === "4") $("short-code-length").value = "5"; });
     $("share-dialog").querySelector(".dialog-close").addEventListener("click", () => $("share-dialog").close());
     document.querySelectorAll('input[name="share-permission"], input[name="share-key"]').forEach((el) => el.addEventListener("change", updateShare));
     $("rotate-write").addEventListener("click", rotateWriteCapability);
@@ -353,6 +497,7 @@
       }
       else { $("encryption-state").textContent = "Без шифрования"; renderItems(); }
       connect();
+	  $("share").disabled = false;
 	  await consumeSharedPayload();
     } catch (error) { message("room-error", error.message); $("item-text").disabled = true; $("send").disabled = true; }
   }
@@ -373,11 +518,14 @@
   function updateAccessState() {
     if (!state.room) return;
     state.canWrite = !state.room.writeProtected || Boolean(state.writeToken);
+    const unlocked = !state.room.encrypted || Boolean(state.key);
     show("item-form", state.canWrite);
     show("access-notice", !state.canWrite);
     show("file-drop", state.canWrite);
 	show("clear-room", state.canWrite);
-    $("file-input").disabled = !state.canWrite || (state.room.encrypted && !state.key);
+    $("item-text").disabled = !state.canWrite || !unlocked;
+    $("send").disabled = !state.canWrite || !unlocked;
+    $("file-input").disabled = !state.canWrite || !unlocked;
   }
 
   function updateFavoriteButton() {
@@ -694,7 +842,7 @@
 
   async function ensureDownloadWorker() {
     if (!navigator.serviceWorker) throw new Error("Браузер не поддерживает потоковое скачивание зашифрованных файлов");
-    state.downloadRegistration = await navigator.serviceWorker.register("/assets/download-sw.js?v=9", { scope:"/" });
+    state.downloadRegistration = await navigator.serviceWorker.register("/assets/download-sw.js?v=11", { scope:"/" });
     await navigator.serviceWorker.ready;
     if (!navigator.serviceWorker.controller) {
       await new Promise((resolve, reject) => {
@@ -924,8 +1072,9 @@
     socket.addEventListener("close", () => { connection.textContent = "Переподключение…"; connection.classList.remove("online"); setTimeout(connect, 1500 + Math.random()*1500); });
   }
 
-  function openShare() { updateShare(); $("share-dialog").showModal(); }
+  function openShare() { updateShare(); if (!$("short-pin").value) $("short-pin").value = randomPIN(); show("short-result", false); message("short-create-error", ""); $("share-dialog").showModal(); }
   function updateShare() {
+    show("short-result", false);
     const writeProtected = Boolean(state.room?.writeProtected);
     const permission = writeProtected ? (document.querySelector('input[name="share-permission"]:checked')?.value || "read") : "write";
     const withKey = !state.room?.encrypted || document.querySelector('input[name="share-key"]:checked')?.value === "key";
@@ -950,6 +1099,33 @@
     else qr.textContent = "QR-код недоступен";
   }
 
+  function randomPIN() {
+    const values = new Uint16Array(1);
+    do { crypto.getRandomValues(values); } while (values[0] >= 60000);
+    return String(values[0] % 10000).padStart(4, "0");
+  }
+
+  async function createShortLink() {
+    message("short-create-error", ""); show("short-result", false);
+    const pin = $("short-pin").value;
+    const expiresInSeconds = Number($("short-ttl").value);
+    const codeLength = Number($("short-code-length").value);
+    const maxUses = $("short-one-time").checked ? 1 : 0;
+    if (!/^\d{4}$/.test(pin)) { message("short-create-error", "PIN должен содержать четыре цифры"); return; }
+    if (codeLength === 4 && (maxUses !== 1 || expiresInSeconds > 600)) { message("short-create-error", "Код из 4 символов разрешён только для одноразовой ссылки на 10 минут"); return; }
+    if (!globalThis.crypto?.subtle) { message("short-create-error", "Создание защищённой ссылки требует HTTPS или localhost"); return; }
+    const button = $("create-short-link"); button.disabled = true;
+    try {
+      const encrypted = await encryptShortTarget($("share-url").value, pin);
+      const created = await api("/api/short-links", { method:"POST", body:JSON.stringify({ ciphertext:encrypted.ciphertext, iv:encrypted.iv, salt:encrypted.salt, tokenHash:encrypted.tokenHash, kdfIterations:shortLinkKDFIterations, expiresInSeconds, maxUses, codeLength }) });
+      $("short-url").value = `${location.origin}/s/${created.code}`;
+      $("short-result-pin").textContent = pin;
+      $("short-result-expiry").textContent = `${maxUses === 1 ? "Одно использование" : "Многократная"} · действует до ${new Date(created.expiresAt).toLocaleString()}`;
+      show("short-result");
+    } catch (error) { message("short-create-error", error.message); }
+    finally { button.disabled = false; }
+  }
+
   async function rotateWriteCapability() {
     if (!confirm("Отозвать все ранее созданные R/W-ссылки?")) return;
     const next = newWriteToken();
@@ -963,5 +1139,5 @@
 
 	document.addEventListener("visibilitychange",()=>{if(!document.hidden){state.unread=0;updateUnread();}});
 	initPWA();
-  if (roomMatch) initRoom(); else if (location.pathname === "/" || location.pathname === "/share-target") initHome();
+  if (roomMatch) initRoom(); else if (shortMatch) initShortLink(); else if (location.pathname === "/" || location.pathname === "/share-target") initHome();
 })();
