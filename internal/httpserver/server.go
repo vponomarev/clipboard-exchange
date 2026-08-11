@@ -904,7 +904,11 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request) {
 	defer conn.Close(websocket.StatusNormalClosure, "")
 	updates, unsubscribe := s.hub.subscribe(roomID)
 	defer unsubscribe()
-	ctx := r.Context()
+	// The application protocol is server-to-client only, but the connection
+	// still has to be read so the library can process ping, pong and close
+	// control frames. CloseRead provides that read loop and cancels the
+	// returned context as soon as the peer disconnects.
+	ctx := conn.CloseRead(r.Context())
 	if err := wsjson.Write(ctx, conn, map[string]string{"type": "ready"}); err != nil {
 		return
 	}

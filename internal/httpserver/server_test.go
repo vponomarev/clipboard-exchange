@@ -247,9 +247,19 @@ func TestRealtimeNotification(t *testing.T) {
 	if err := wsjson.Read(ctx, conn, &event); err != nil || event["type"] != "ready" {
 		t.Fatalf("ready: %#v %v", event, err)
 	}
+	readResult := make(chan error, 1)
+	go func() {
+		readResult <- wsjson.Read(ctx, conn, &event)
+	}()
+	pingCtx, cancelPing := context.WithTimeout(ctx, time.Second)
+	if err := conn.Ping(pingCtx); err != nil {
+		cancelPing()
+		t.Fatalf("ping: %v", err)
+	}
+	cancelPing()
 	resp = requestJSONWithToken(t, client, "POST", ts.URL+"/api/rooms/live/items", map[string]any{"id": "123e4567-e89b-12d3-a456-426614174000", "kind": "text", "content": "hello"}, testWriteToken)
 	resp.Body.Close()
-	if err := wsjson.Read(ctx, conn, &event); err != nil || event["type"] != "refresh" {
+	if err := <-readResult; err != nil || event["type"] != "refresh" {
 		t.Fatalf("refresh: %#v %v", event, err)
 	}
 }
