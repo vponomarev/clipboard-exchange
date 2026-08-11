@@ -49,12 +49,26 @@ type DeletedObjects struct {
 
 type Statistics struct {
 	Rooms         int64
+	ShortLinks    int64
 	Items         int64
 	Entries       int64
 	Files         int64
 	FileBytes     int64
 	ActiveUploads int64
 	ReservedBytes int64
+}
+
+type ShortLink struct {
+	Code          string `json:"code"`
+	Ciphertext    string `json:"ciphertext"`
+	IV            string `json:"iv"`
+	Salt          string `json:"salt"`
+	TokenHash     string `json:"-"`
+	KDFIterations int    `json:"kdfIterations"`
+	MaxUses       int    `json:"maxUses"`
+	UseCount      int    `json:"useCount"`
+	ExpiresAt     string `json:"expiresAt"`
+	CreatedAt     string `json:"createdAt"`
 }
 
 type Item struct {
@@ -131,7 +145,7 @@ func Open(path string) (*Store, error) {
 			db.Close()
 			return nil, errors.New("legacy database schema is unsupported; archive it and start with an empty database")
 		}
-	} else if version != 2 && version != 3 && version != 4 && version != 5 {
+	} else if version != 2 && version != 3 && version != 4 && version != 5 && version != 6 {
 		db.Close()
 		return nil, fmt.Errorf("unsupported database schema version %d", version)
 	}
@@ -318,7 +332,20 @@ func Open(path string) (*Store, error) {
 		`CREATE INDEX IF NOT EXISTS uploads_expiry ON uploads(expires_at)`,
 		`CREATE INDEX IF NOT EXISTS files_room_created ON files(room_id, created_at, id)`,
 		`CREATE INDEX IF NOT EXISTS files_room_entry ON files(room_id, entry_id)`,
-		`PRAGMA user_version=5`,
+		`CREATE TABLE IF NOT EXISTS short_links (
+			code TEXT PRIMARY KEY,
+			ciphertext TEXT NOT NULL,
+			iv TEXT NOT NULL,
+			salt TEXT NOT NULL,
+			token_hash TEXT NOT NULL,
+			kdf_iterations INTEGER NOT NULL,
+			max_uses INTEGER NOT NULL,
+			use_count INTEGER NOT NULL DEFAULT 0,
+			expires_at TEXT NOT NULL,
+			created_at TEXT NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS short_links_expiry ON short_links(expires_at)`,
+		`PRAGMA user_version=6`,
 	} {
 		if _, err := db.Exec(stmt); err != nil {
 			db.Close()
@@ -329,6 +356,77 @@ func Open(path string) (*Store, error) {
 }
 
 func (s *Store) Close() error { return s.db.Close() }
+
+func (s *Store) CreateShortLink(ctx context.Context, link ShortLink, maxActive int) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	var active int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM short_links WHERE expires_at>? AND (max_uses=0 OR use_count<max_uses)`, now).Scan(&active); err != nil {
+		return err
+	}
+	if active >= maxActive {
+		return ErrLimit
+	}
+	link.CreatedAt = now
+	_, err = tx.ExecContext(ctx, `INSERT INTO short_links(code,ciphertext,iv,salt,token_hash,kdf_iterations,max_uses,use_count,expires_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)`, link.Code, link.Ciphertext, link.IV, link.Salt, link.TokenHash, link.KDFIterations, link.MaxUses, 0, link.ExpiresAt, link.CreatedAt)
+	if isConstraint(err) {
+		return ErrConflict
+	}
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Store) GetShortLink(ctx context.Context, code string) (ShortLink, error) {
+	var link ShortLink
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	err := s.db.QueryRowContext(ctx, `SELECT code,ciphertext,iv,salt,token_hash,kdf_iterations,max_uses,use_count,expires_at,created_at FROM short_links WHERE code=? AND expires_at>? AND (max_uses=0 OR use_count<max_uses)`, code, now).Scan(&link.Code, &link.Ciphertext, &link.IV, &link.Salt, &link.TokenHash, &link.KDFIterations, &link.MaxUses, &link.UseCount, &link.ExpiresAt, &link.CreatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ShortLink{}, ErrNotFound
+	}
+	return link, err
+}
+
+func (s *Store) RedeemShortLink(ctx context.Context, code, candidateHash string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	var tokenHash string
+	err = tx.QueryRowContext(ctx, `SELECT token_hash FROM short_links WHERE code=? AND expires_at>? AND (max_uses=0 OR use_count<max_uses)`, code, now).Scan(&tokenHash)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if subtle.ConstantTimeCompare([]byte(tokenHash), []byte(candidateHash)) != 1 {
+		return ErrForbidden
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE short_links SET use_count=use_count+1 WHERE code=? AND expires_at>? AND (max_uses=0 OR use_count<max_uses)`, code, now)
+	if err != nil {
+		return err
+	}
+	if n, _ := result.RowsAffected(); n != 1 {
+		return ErrNotFound
+	}
+	return tx.Commit()
+}
+
+func (s *Store) DeleteExpiredShortLinks(ctx context.Context, now time.Time) (int64, error) {
+	result, err := s.db.ExecContext(ctx, `DELETE FROM short_links WHERE expires_at<=?`, now.UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
 
 func (s *Store) Snapshot(ctx context.Context, target string) error {
 	if target == "" {
@@ -1230,6 +1328,7 @@ func (s *Store) Stats(ctx context.Context) (Statistics, error) {
 		target *int64
 	}{
 		{`SELECT COUNT(*) FROM rooms`, &stats.Rooms},
+		{`SELECT COUNT(*) FROM short_links`, &stats.ShortLinks},
 		{`SELECT COUNT(*) FROM items`, &stats.Items},
 		{`SELECT COUNT(*) FROM entries`, &stats.Entries},
 		{`SELECT COUNT(*) FROM files`, &stats.Files},

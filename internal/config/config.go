@@ -10,39 +10,43 @@ import (
 )
 
 type Config struct {
-	Listen           string
-	DatabasePath     string
-	TLSCert          string
-	TLSKey           string
-	RoomTTL          time.Duration
-	MaxItemBytes     int64
-	MaxItemsPerRoom  int
-	MaxRooms         int
-	RateLimit        int
-	TrustProxy       bool
-	FilesDir         string
-	MaxFileBytes     int64
-	MaxRoomFileBytes int64
-	FileChunkBytes   int64
-	UploadTTL        time.Duration
-	MaxActiveUploads int
+	Listen             string
+	DatabasePath       string
+	TLSCert            string
+	TLSKey             string
+	RoomTTL            time.Duration
+	MaxItemBytes       int64
+	MaxItemsPerRoom    int
+	MaxRooms           int
+	RateLimit          int
+	ShortLinkRateLimit int
+	MaxShortLinks      int
+	TrustProxy         bool
+	FilesDir           string
+	MaxFileBytes       int64
+	MaxRoomFileBytes   int64
+	FileChunkBytes     int64
+	UploadTTL          time.Duration
+	MaxActiveUploads   int
 }
 
 func Default() Config {
 	return Config{
-		Listen:           ":8080",
-		DatabasePath:     "clipboard-exchange.db",
-		RoomTTL:          30 * 24 * time.Hour,
-		MaxItemBytes:     64 << 10,
-		MaxItemsPerRoom:  500,
-		MaxRooms:         10_000,
-		RateLimit:        120,
-		FilesDir:         "clipboard-exchange-files",
-		MaxFileBytes:     500 << 20,
-		MaxRoomFileBytes: 500 << 20,
-		FileChunkBytes:   1 << 20,
-		UploadTTL:        24 * time.Hour,
-		MaxActiveUploads: 32,
+		Listen:             ":8080",
+		DatabasePath:       "clipboard-exchange.db",
+		RoomTTL:            30 * 24 * time.Hour,
+		MaxItemBytes:       64 << 10,
+		MaxItemsPerRoom:    500,
+		MaxRooms:           10_000,
+		RateLimit:          120,
+		ShortLinkRateLimit: 30,
+		MaxShortLinks:      10_000,
+		FilesDir:           "clipboard-exchange-files",
+		MaxFileBytes:       500 << 20,
+		MaxRoomFileBytes:   500 << 20,
+		FileChunkBytes:     1 << 20,
+		UploadTTL:          24 * time.Hour,
+		MaxActiveUploads:   32,
 	}
 }
 
@@ -56,6 +60,8 @@ func BindFlags(fs *flag.FlagSet, cfg *Config) {
 	fs.IntVar(&cfg.MaxItemsPerRoom, "max-items-per-room", cfg.MaxItemsPerRoom, "maximum items retained per room")
 	fs.IntVar(&cfg.MaxRooms, "max-rooms", cfg.MaxRooms, "maximum rooms")
 	fs.IntVar(&cfg.RateLimit, "rate-limit", cfg.RateLimit, "mutating requests per IP per minute (0 disables)")
+	fs.IntVar(&cfg.ShortLinkRateLimit, "short-link-rate-limit", cfg.ShortLinkRateLimit, "short-link retrieval requests per IP per minute (0 disables)")
+	fs.IntVar(&cfg.MaxShortLinks, "max-short-links", cfg.MaxShortLinks, "maximum active short links")
 	fs.BoolVar(&cfg.TrustProxy, "trust-proxy", false, "trust Forwarded and X-Forwarded-* headers")
 	fs.StringVar(&cfg.FilesDir, "files-dir", cfg.FilesDir, "directory for uploaded files and temporary chunks")
 	fs.Int64Var(&cfg.MaxFileBytes, "max-file-bytes", cfg.MaxFileBytes, "maximum stored bytes per file")
@@ -120,6 +126,12 @@ func ApplyEnvironment(cfg *Config) error {
 	if err := setInt("CLIPBOARD_EXCHANGE_RATE_LIMIT", &cfg.RateLimit); err != nil {
 		return err
 	}
+	if err := setInt("CLIPBOARD_EXCHANGE_SHORT_LINK_RATE_LIMIT", &cfg.ShortLinkRateLimit); err != nil {
+		return err
+	}
+	if err := setInt("CLIPBOARD_EXCHANGE_MAX_SHORT_LINKS", &cfg.MaxShortLinks); err != nil {
+		return err
+	}
 	if err := setInt64("CLIPBOARD_EXCHANGE_MAX_FILE_BYTES", &cfg.MaxFileBytes); err != nil {
 		return err
 	}
@@ -156,7 +168,7 @@ func (c Config) Validate() error {
 	if (c.TLSCert == "") != (c.TLSKey == "") {
 		return errors.New("tls-cert and tls-key must be specified together")
 	}
-	if c.RoomTTL < 0 || c.MaxItemBytes < 1 || c.MaxItemsPerRoom < 1 || c.MaxRooms < 1 || c.RateLimit < 0 || c.MaxFileBytes < 1 || c.MaxRoomFileBytes < 1 || c.FileChunkBytes < 1 || c.FileChunkBytes > c.MaxFileBytes || c.UploadTTL <= 0 || c.MaxActiveUploads < 1 {
+	if c.RoomTTL < 0 || c.MaxItemBytes < 1 || c.MaxItemsPerRoom < 1 || c.MaxRooms < 1 || c.RateLimit < 0 || c.ShortLinkRateLimit < 0 || c.MaxShortLinks < 1 || c.MaxFileBytes < 1 || c.MaxRoomFileBytes < 1 || c.FileChunkBytes < 1 || c.FileChunkBytes > c.MaxFileBytes || c.UploadTTL <= 0 || c.MaxActiveUploads < 1 {
 		return errors.New("limits must be positive (rate-limit and room-ttl may be zero)")
 	}
 	return nil

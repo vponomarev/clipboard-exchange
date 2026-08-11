@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"html"
 	"io"
 	"io/fs"
 	"log"
@@ -38,19 +39,29 @@ import (
 var webFiles embed.FS
 
 var (
-	roomIDPattern   = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`)
-	objectIDPattern = regexp.MustCompile(`^[0-9a-fA-F-]{36}$`)
+	roomIDPattern    = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`)
+	objectIDPattern  = regexp.MustCompile(`^[0-9a-fA-F-]{36}$`)
+	shortCodePattern = regexp.MustCompile(`^[23456789ABCDEFGHJKMNPQRSTVWXYZ]{4,6}$`)
+	hexHashPattern   = regexp.MustCompile(`^[0-9a-f]{64}$`)
+)
+
+const (
+	shortLinkKDFIterations = 600_000
+	shortLinkCipherBytes   = 528
+	shortLinkAlphabet      = "23456789ABCDEFGHJKMNPQRSTVWXYZ"
 )
 
 type Server struct {
-	cfg     config.Config
-	store   *store.Store
-	files   *filestore.Store
-	log     *log.Logger
-	hub     *hub
-	limiter *rateLimiter
-	static  http.Handler
-	started time.Time
+	cfg          config.Config
+	store        *store.Store
+	files        *filestore.Store
+	log          *log.Logger
+	hub          *hub
+	limiter      *rateLimiter
+	shortLimiter *rateLimiter
+	static       http.Handler
+	started      time.Time
+	version      string
 }
 
 type roomResponse struct {
@@ -61,12 +72,19 @@ type roomResponse struct {
 }
 
 func New(cfg config.Config, db *store.Store, files *filestore.Store, logger *log.Logger) http.Handler {
+	return NewWithVersion(cfg, db, files, logger, "dev")
+}
+
+func NewWithVersion(cfg config.Config, db *store.Store, files *filestore.Store, logger *log.Logger, version string) http.Handler {
 	assets, _ := fs.Sub(webFiles, "web")
-	s := &Server{cfg: cfg, store: db, files: files, log: logger, hub: newHub(), limiter: newRateLimiter(cfg.RateLimit), static: http.FileServer(http.FS(assets)), started: time.Now()}
+	s := &Server{cfg: cfg, store: db, files: files, log: logger, hub: newHub(), limiter: newRateLimiter(cfg.RateLimit), shortLimiter: newRateLimiter(cfg.ShortLinkRateLimit), static: http.FileServer(http.FS(assets)), started: time.Now(), version: version}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
 	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
 	mux.HandleFunc("GET /api/capabilities", s.capabilities)
+	mux.HandleFunc("POST /api/short-links", s.createShortLink)
+	mux.HandleFunc("GET /api/short-links/{code}", s.getShortLink)
+	mux.HandleFunc("POST /api/short-links/{code}/redeem", s.redeemShortLink)
 	mux.HandleFunc("POST /api/rooms", s.createRoom)
 	mux.HandleFunc("GET /api/rooms/{room}", s.getRoom)
 	mux.HandleFunc("POST /api/rooms/{room}/entries", s.createEntry)
@@ -91,6 +109,7 @@ func New(cfg config.Config, db *store.Store, files *filestore.Store, logger *log
 	mux.HandleFunc("GET /assets/icon-512.png", func(w http.ResponseWriter, _ *http.Request) { serveIcon(w, 512) })
 	mux.HandleFunc("GET /assets/", s.asset)
 	mux.HandleFunc("GET /r/{room}", s.page)
+	mux.HandleFunc("GET /s/{code}", s.page)
 	mux.HandleFunc("GET /share-target", s.page)
 	mux.HandleFunc("POST /share-target", s.shareTargetFallback)
 	mux.HandleFunc("GET /", s.page)
@@ -98,7 +117,9 @@ func New(cfg config.Config, db *store.Store, files *filestore.Store, logger *log
 }
 
 func (s *Server) page(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" && r.URL.Path != "/share-target" && !roomIDPattern.MatchString(r.PathValue("room")) {
+	validRoomPage := strings.HasPrefix(r.URL.Path, "/r/") && roomIDPattern.MatchString(r.PathValue("room"))
+	validShortPage := strings.HasPrefix(r.URL.Path, "/s/") && shortCodePattern.MatchString(strings.ToUpper(r.PathValue("code")))
+	if r.URL.Path != "/" && r.URL.Path != "/share-target" && !validRoomPage && !validShortPage {
 		http.NotFound(w, r)
 		return
 	}
@@ -108,7 +129,13 @@ func (s *Server) page(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-cache")
+	if validShortPage {
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("X-Robots-Tag", "noindex, nofollow")
+	} else {
+		w.Header().Set("Cache-Control", "no-cache")
+	}
+	b = bytes.ReplaceAll(b, []byte("__CLIPBOARD_EXCHANGE_VERSION__"), []byte(html.EscapeString(s.version)))
 	_, _ = w.Write(b)
 }
 
@@ -162,8 +189,10 @@ func (s *Server) createRoom(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) capabilities(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusOK, map[string]any{
-		"protocolVersion":        5,
+		"serverVersion":          s.version,
+		"protocolVersion":        6,
 		"writeCapabilities":      true,
 		"openWriteRooms":         true,
 		"groupedAttachments":     true,
@@ -173,6 +202,8 @@ func (s *Server) capabilities(w http.ResponseWriter, _ *http.Request) {
 		"roomTTL":                true,
 		"pwa":                    true,
 		"qrScanner":              true,
+		"shortLinks":             true,
+		"shortLinkKDFIterations": shortLinkKDFIterations,
 		"aliases":                true,
 		"encryptedTextVersions":  []int{1, 2},
 		"files":                  true,
@@ -188,6 +219,144 @@ func (s *Server) capabilities(w http.ResponseWriter, _ *http.Request) {
 			"fileChunkBytes":   s.cfg.FileChunkBytes,
 		},
 	})
+}
+
+func (s *Server) createShortLink(w http.ResponseWriter, r *http.Request) {
+	if !s.allowMutation(w, r) {
+		return
+	}
+	var req struct {
+		Ciphertext       string `json:"ciphertext"`
+		IV               string `json:"iv"`
+		Salt             string `json:"salt"`
+		TokenHash        string `json:"tokenHash"`
+		KDFIterations    int    `json:"kdfIterations"`
+		ExpiresInSeconds int64  `json:"expiresInSeconds"`
+		MaxUses          int    `json:"maxUses"`
+		CodeLength       int    `json:"codeLength"`
+	}
+	if !decodeJSON(w, r, &req, 4096) {
+		return
+	}
+	if req.KDFIterations != shortLinkKDFIterations || !validEncodedBytes(req.Ciphertext, shortLinkCipherBytes) || !validEncodedBytes(req.IV, 12) || !validEncodedBytes(req.Salt, 16) || !hexHashPattern.MatchString(req.TokenHash) || req.ExpiresInSeconds < 60 || req.ExpiresInSeconds > 7*24*60*60 || (req.MaxUses != 0 && req.MaxUses != 1) || req.CodeLength < 4 || req.CodeLength > 6 || (req.CodeLength == 4 && (req.MaxUses != 1 || req.ExpiresInSeconds > 10*60)) {
+		writeError(w, http.StatusBadRequest, "invalid_short_link", "Invalid short-link envelope or lifetime")
+		return
+	}
+	expiresAt := time.Now().UTC().Add(time.Duration(req.ExpiresInSeconds) * time.Second).Format(time.RFC3339Nano)
+	for attempts := 0; attempts < 16; attempts++ {
+		code, err := randomShortCode(req.CodeLength)
+		if err != nil {
+			s.storeError(w, err)
+			return
+		}
+		err = s.store.CreateShortLink(r.Context(), store.ShortLink{Code: code, Ciphertext: req.Ciphertext, IV: req.IV, Salt: req.Salt, TokenHash: req.TokenHash, KDFIterations: req.KDFIterations, MaxUses: req.MaxUses, ExpiresAt: expiresAt}, s.cfg.MaxShortLinks)
+		if errors.Is(err, store.ErrConflict) {
+			continue
+		}
+		if err != nil {
+			s.storeError(w, err)
+			return
+		}
+		w.Header().Set("Location", "/s/"+code)
+		w.Header().Set("Cache-Control", "no-store")
+		writeJSON(w, http.StatusCreated, map[string]any{"code": code, "expiresAt": expiresAt, "maxUses": req.MaxUses})
+		return
+	}
+	writeError(w, http.StatusServiceUnavailable, "code_space_busy", "Could not allocate a short code")
+}
+
+func (s *Server) getShortLink(w http.ResponseWriter, r *http.Request) {
+	if !s.shortLimiter.allow("short:" + s.clientIP(r)) {
+		w.Header().Set("Retry-After", "60")
+		writeError(w, http.StatusTooManyRequests, "rate_limited", "Too many short-link requests")
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	code := strings.ToUpper(r.PathValue("code"))
+	if shortCodePattern.MatchString(code) {
+		if link, err := s.store.GetShortLink(r.Context(), code); err == nil {
+			writeJSON(w, http.StatusOK, map[string]any{"version": 1, "ciphertext": link.Ciphertext, "iv": link.IV, "salt": link.Salt, "kdfIterations": link.KDFIterations})
+			return
+		} else if !errors.Is(err, store.ErrNotFound) {
+			s.storeError(w, err)
+			return
+		}
+	}
+	s.writeFakeShortLink(w)
+}
+
+func (s *Server) redeemShortLink(w http.ResponseWriter, r *http.Request) {
+	if !s.allowMutation(w, r) {
+		return
+	}
+	code := strings.ToUpper(r.PathValue("code"))
+	var req struct {
+		RedemptionToken string `json:"redemptionToken"`
+	}
+	if !decodeJSON(w, r, &req, 1024) {
+		return
+	}
+	if !shortCodePattern.MatchString(code) || !validEncodedBytes(req.RedemptionToken, 32) {
+		writeError(w, http.StatusNotFound, "short_link_unavailable", "Short link is unavailable")
+		return
+	}
+	digest := sha256.Sum256([]byte(req.RedemptionToken))
+	err := s.store.RedeemShortLink(r.Context(), code, fmt.Sprintf("%x", digest[:]))
+	if errors.Is(err, store.ErrNotFound) || errors.Is(err, store.ErrForbidden) {
+		writeError(w, http.StatusNotFound, "short_link_unavailable", "Short link is unavailable")
+		return
+	}
+	if err != nil {
+		s.storeError(w, err)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) writeFakeShortLink(w http.ResponseWriter) {
+	ciphertext := make([]byte, shortLinkCipherBytes)
+	iv := make([]byte, 12)
+	salt := make([]byte, 16)
+	if _, err := rand.Read(ciphertext); err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if _, err := rand.Read(iv); err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if _, err := rand.Read(salt); err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"version": 1, "ciphertext": base64.RawURLEncoding.EncodeToString(ciphertext), "iv": base64.RawURLEncoding.EncodeToString(iv), "salt": base64.RawURLEncoding.EncodeToString(salt), "kdfIterations": shortLinkKDFIterations})
+}
+
+func randomShortCode(length int) (string, error) {
+	out := make([]byte, length)
+	random := make([]byte, length*2)
+	for index := 0; index < length; {
+		if _, err := rand.Read(random); err != nil {
+			return "", err
+		}
+		for _, value := range random {
+			if int(value) >= 240 {
+				continue
+			}
+			out[index] = shortLinkAlphabet[int(value)%len(shortLinkAlphabet)]
+			index++
+			if index == length {
+				break
+			}
+		}
+	}
+	return string(out), nil
+}
+
+func validEncodedBytes(value string, size int) bool {
+	decoded, err := base64.RawURLEncoding.DecodeString(value)
+	return err == nil && len(decoded) == size
 }
 
 func (s *Server) getRoom(w http.ResponseWriter, r *http.Request) {
@@ -956,6 +1125,7 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	_, _ = fmt.Fprintf(w, "# HELP clipboard_exchange_rooms Current rooms.\n# TYPE clipboard_exchange_rooms gauge\nclipboard_exchange_rooms %d\n", stats.Rooms)
+	_, _ = fmt.Fprintf(w, "# HELP clipboard_exchange_short_links Stored short links awaiting expiry.\n# TYPE clipboard_exchange_short_links gauge\nclipboard_exchange_short_links %d\n", stats.ShortLinks)
 	_, _ = fmt.Fprintf(w, "# HELP clipboard_exchange_entries Atomic entry metadata rows.\n# TYPE clipboard_exchange_entries gauge\nclipboard_exchange_entries %d\n", stats.Entries)
 	_, _ = fmt.Fprintf(w, "# HELP clipboard_exchange_items Text payload rows.\n# TYPE clipboard_exchange_items gauge\nclipboard_exchange_items %d\n", stats.Items)
 	_, _ = fmt.Fprintf(w, "# HELP clipboard_exchange_files Stored files.\n# TYPE clipboard_exchange_files gauge\nclipboard_exchange_files %d\n", stats.Files)
