@@ -1,6 +1,7 @@
 package httpserver
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"crypto/aes"
@@ -350,7 +351,7 @@ func TestCapabilitiesAndAliasLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
-	if capabilities["serverVersion"] != "dev" || capabilities["protocolVersion"] != float64(6) || capabilities["writeCapabilities"] != true || capabilities["openWriteRooms"] != true || capabilities["groupedAttachments"] != true || capabilities["inlineFiles"] != true || capabilities["aliases"] != true || capabilities["atomicEntries"] != true || capabilities["entryTTL"] != true || capabilities["roomTTL"] != true || capabilities["pwa"] != true || capabilities["qrScanner"] != true || capabilities["shortLinks"] != true || capabilities["shortLinkKDFIterations"] != float64(shortLinkKDFIterations) {
+	if capabilities["serverVersion"] != "dev" || capabilities["protocolVersion"] != float64(6) || capabilities["writeCapabilities"] != true || capabilities["openWriteRooms"] != true || capabilities["groupedAttachments"] != true || capabilities["entryArchives"] != true || capabilities["inlineFiles"] != true || capabilities["aliases"] != true || capabilities["atomicEntries"] != true || capabilities["entryTTL"] != true || capabilities["roomTTL"] != true || capabilities["pwa"] != true || capabilities["qrScanner"] != true || capabilities["shortLinks"] != true || capabilities["shortLinkKDFIterations"] != float64(shortLinkKDFIterations) {
 		t.Fatalf("unexpected capabilities: %#v", capabilities)
 	}
 	if got := resp.Header.Get("Cache-Control"); got != "no-store" {
@@ -433,7 +434,7 @@ func TestAtomicTextEntryPinClearMetricsAndPWA(t *testing.T) {
 	if resp.StatusCode != http.StatusOK || !bytes.Contains(metrics, []byte("clipboard_exchange_rooms 1")) || bytes.Contains(metrics, []byte("exact")) {
 		t.Fatalf("unsafe or incomplete metrics: %s", metrics)
 	}
-	for _, asset := range []string{"/assets/manifest.webmanifest?v=2", "/assets/download-sw.js?v=11", "/assets/icon-192.png", "/assets/icon-512.png"} {
+	for _, asset := range []string{"/assets/manifest.webmanifest?v=2", "/assets/download-sw.js?v=13", "/assets/icon-192.png", "/assets/icon-512.png"} {
 		response, err := client.Get(ts.URL + asset)
 		if err != nil {
 			t.Fatal(err)
@@ -522,6 +523,93 @@ func TestDownloadOnceDeletesOnlyAfterFullResponse(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("download-once file remains: %s", resp.Status)
+	}
+}
+
+func TestEntryArchiveStreamsStoredFilesWithoutCompression(t *testing.T) {
+	ts := testServer(t)
+	client := ts.Client()
+	resp := requestJSON(t, client, http.MethodPost, ts.URL+"/api/rooms", map[string]any{"id": "archive", "writeProtected": false})
+	resp.Body.Close()
+	entryID := "123e4567-e89b-12d3-a456-426614174041"
+	resp = requestJSON(t, client, http.MethodPost, ts.URL+"/api/rooms/archive/entries", map[string]any{"id": entryID, "expectedFiles": 2})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create entry: %s", resp.Status)
+	}
+	resp.Body.Close()
+
+	type createdUpload struct {
+		ID          string `json:"id"`
+		FileID      string `json:"fileId"`
+		UploadToken string `json:"uploadToken"`
+	}
+	fileIDs := make([]string, 0, 2)
+	for index, testFile := range []struct{ name, body string }{{"../same.txt", "first"}, {"same.txt", "second"}} {
+		resp = requestJSON(t, client, http.MethodPost, ts.URL+"/api/rooms/archive/uploads", map[string]any{"entryId": entryID, "entryIndex": index, "name": testFile.name, "mimeType": "text/plain", "size": len(testFile.body)})
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("create upload %d: %s", index, resp.Status)
+		}
+		var upload createdUpload
+		if err := json.NewDecoder(resp.Body).Decode(&upload); err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		fileIDs = append(fileIDs, upload.FileID)
+		resp = requestUpload(t, client, http.MethodPut, ts.URL+"/api/rooms/archive/uploads/"+upload.ID+"/chunks/0", strings.NewReader(testFile.body), upload.UploadToken)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("put chunk %d: %s", index, resp.Status)
+		}
+		resp.Body.Close()
+		resp = requestUpload(t, client, http.MethodPost, ts.URL+"/api/rooms/archive/uploads/"+upload.ID+"/complete", nil, upload.UploadToken)
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("complete upload %d: %s", index, resp.Status)
+		}
+		resp.Body.Close()
+	}
+	resp = requestJSON(t, client, http.MethodPost, ts.URL+"/api/rooms/archive/entries/"+entryID+"/commit", nil)
+	resp.Body.Close()
+
+	resp, err := client.Get(ts.URL + "/api/rooms/archive/entries/" + entryID + "/archive")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("archive: status=%s err=%v", resp.Status, err)
+	}
+	if resp.Header.Get("Content-Type") != "application/zip" || !strings.Contains(resp.Header.Get("Content-Disposition"), "files-123e4567.zip") {
+		t.Fatalf("archive headers: type=%q disposition=%q", resp.Header.Get("Content-Type"), resp.Header.Get("Content-Disposition"))
+	}
+	reader, err := zip.NewReader(bytes.NewReader(body), int64(len(body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reader.File) != 2 {
+		t.Fatalf("archive members: %d", len(reader.File))
+	}
+	for index, expected := range []struct{ name, body string }{{"same.txt", "first"}, {"same (2).txt", "second"}} {
+		member := reader.File[index]
+		if member.Name != expected.name || member.Method != zip.Store {
+			t.Fatalf("member %d: name=%q method=%d", index, member.Name, member.Method)
+		}
+		opened, openErr := member.Open()
+		if openErr != nil {
+			t.Fatal(openErr)
+		}
+		contents, readErr := io.ReadAll(opened)
+		opened.Close()
+		if readErr != nil || string(contents) != expected.body {
+			t.Fatalf("member %d: body=%q err=%v", index, contents, readErr)
+		}
+	}
+	resp, err = client.Get(ts.URL + "/api/rooms/archive/files/" + fileIDs[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("archive unexpectedly consumed entry: %s", resp.Status)
 	}
 }
 
@@ -746,17 +834,17 @@ func TestServesEmbeddedApplication(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Contains(body, []byte(`/assets/app.js?v=17`)) {
+	if !bytes.Contains(body, []byte(`/assets/app.js?v=19`)) {
 		t.Fatal("page does not cache-bust app.js")
 	}
-	if !bytes.Contains(body, []byte(`/assets/style.css?v=14`)) {
+	if !bytes.Contains(body, []byte(`/assets/style.css?v=15`)) {
 		t.Fatal("page does not cache-bust style.css")
 	}
 	if !bytes.Contains(body, []byte(`name="clipboard-exchange-version" content="v-test"`)) || bytes.Contains(body, []byte("__CLIPBOARD_EXCHANGE_VERSION__")) {
 		t.Fatal("page does not expose the embedded shell version")
 	}
 
-	resp, err = ts.Client().Get(ts.URL + "/assets/app.js?v=17")
+	resp, err = ts.Client().Get(ts.URL + "/assets/app.js?v=19")
 	if err != nil {
 		t.Fatal(err)
 	}

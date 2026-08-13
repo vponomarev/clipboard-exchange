@@ -106,6 +106,16 @@ input:focus, textarea:focus { border-color:var(--accent); box-shadow:0 0 0 3px c
 .attachments { display:grid; gap:8px; padding:12px 14px; border-top:1px solid var(--line); }
 .item-content + .attachments { border-top:1px solid var(--line); }
 .file-attachment { display:flex; align-items:center; justify-content:space-between; gap:14px; padding:10px 11px; border:1px solid var(--line); border-radius:12px; background:var(--surface-2); }
+.attachments-table-wrap { display:block; overflow-x:auto; }
+.attachments-table { width:100%; border-collapse:collapse; table-layout:auto; }
+.attachments-table th { padding:0 10px 7px; color:var(--muted); font-size:11px; font-weight:650; text-align:left; white-space:nowrap; }
+.attachments-table th:nth-child(2), .attachments-table td:nth-child(2) { width:1%; white-space:nowrap; }
+.attachments-table th:last-child { text-align:right; }
+.attachments-table .file-attachment-row { display:table-row; border:0; border-radius:0; background:transparent; }
+.attachments-table td { padding:8px 10px; border-top:1px solid var(--line); vertical-align:middle; }
+.attachments-table .file-details { min-width:180px; }
+.attachments-table .file-actions { width:1%; }
+.attachments-table .item-buttons { min-width:max-content; flex-wrap:nowrap; }
 .item-content { margin:0; padding:17px 18px; overflow:auto; white-space:pre-wrap; overflow-wrap:anywhere; font:14px/1.55 ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace; }
 .item-content.collapsed { max-height:calc(3.1em + 34px); overflow:hidden; }
 .item-footer { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:8px 9px 8px 17px; border-top:1px solid var(--line); background:var(--surface-2); }
@@ -198,9 +208,11 @@ dialog .dialog-card { position:relative; display:grid; gap:13px; padding:25px; }
   .composer-options-panel { position:fixed; z-index:20; inset:auto 10px 12px; width:auto; grid-template-columns:1fr; max-height:calc(100vh - 24px); overflow:auto; }
   .composer-options-panel .encryption-state { grid-column:auto; }
   .composer-identity { grid-template-columns:1fr; justify-content:stretch; }
-  .file-attachment { align-items:stretch; flex-direction:column; }
+  .file-attachment:not(.file-attachment-row) { align-items:stretch; flex-direction:column; }
   .item-footer { display:grid; grid-template-columns:minmax(0, 1fr); align-items:start; }
-  .item-footer .item-buttons, .file-attachment .item-buttons { width:100%; justify-content:flex-start; position:relative; z-index:1; }
+  .item-footer .item-buttons, .file-attachment:not(.file-attachment-row) .item-buttons { width:100%; justify-content:flex-start; position:relative; z-index:1; }
+  .attachments-table td { padding:7px 8px; }
+  .attachments-table .file-details { min-width:150px; }
   .item-footer .button { flex:1 1 auto; }
   .scan-dialog { width:100vw; max-width:none; margin:auto 0 0; border-radius:18px 18px 0 0; }
   .scan-card { padding:18px 12px 16px !important; border-radius:18px 18px 0 0 !important; }

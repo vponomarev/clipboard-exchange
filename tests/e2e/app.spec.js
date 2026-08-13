@@ -179,6 +179,8 @@ test("text and multiple files are sent as one entry only after Add", async ({ pa
   await expect(page.locator(".item")).toHaveCount(1);
   await expect(page.locator(".item-content")).toHaveText("Файлы к задаче");
   await expect(page.locator(".file-attachment .file-name")).toHaveText(["script $HOME.txt", "notes.txt"]);
+  await expect(page.locator(".attachments-table tbody tr")).toHaveCount(2);
+  await expect(page.locator(".attachments-table thead")).toContainText("ФайлРазмерДействия");
   await expect(page.locator(".item .item-alias")).toHaveText("Вася");
 
   const data = await (await request.get(`/api/rooms/${room}`)).json();
@@ -188,6 +190,20 @@ test("text and multiple files are sent as one entry only after Add", async ({ pa
   const firstFile = data.files.find(file => file.name === "script $HOME.txt");
   const downloaded = await request.get(`/api/rooms/${room}/files/${firstFile.id}`);
   expect(await downloaded.body()).toEqual(content);
+
+  const archivePromise = page.waitForEvent("download");
+  await page.locator(`a[href$="/entries/${data.items[0].id}/archive"]`).click();
+  const archive = await archivePromise;
+  expect(archive.suggestedFilename()).toBe(`files-${data.items[0].id.slice(0, 8)}.zip`);
+  const archiveStream = await archive.createReadStream();
+  const archiveChunks = [];
+  for await (const chunk of archiveStream) archiveChunks.push(chunk);
+  const archiveBytes = Buffer.concat(archiveChunks);
+  expect(archiveBytes.readUInt32LE(0)).toBe(0x04034b50);
+  expect(archiveBytes.includes(Buffer.from("script $HOME.txt"))).toBe(true);
+  expect(archiveBytes.includes(Buffer.from("notes.txt"))).toBe(true);
+  expect(archiveBytes.includes(content)).toBe(true);
+  expect(archiveBytes.includes(secondContent)).toBe(true);
 
   await page.locator(".file-attachment").filter({ hasText:"script $HOME.txt" }).getByRole("button", { name:"Открыть" }).click();
   await expect(page.locator("#preview-dialog")).toBeVisible();
@@ -282,6 +298,23 @@ test("encrypted room keeps plaintext out of the server response", async ({ page,
     catch (error) { return { error:String(error) }; }
   }, { room, file:data.files[0], size:fileSecret.length });
   expect(streamed).toEqual({ disposition:expect.stringMatching(/^inline/), bytes:Array.from(fileSecret) });
+
+  const archived = await page.evaluate(async ({ room, file, size }) => {
+    const params = new URLSearchParams(location.hash.slice(1));
+    const token = crypto.randomUUID();
+    const channel = new MessageChannel();
+    const ready = new Promise(resolve => { channel.port1.onmessage = resolve; });
+    navigator.serviceWorker.controller.postMessage({ type:"prepare-archive", token, config:{ archive:true, name:"private-files.zip", files:[{ rawKey:params.get("key").slice(4), roomID:room, fileID:file.id, chunkSize:file.chunkSize, chunkCount:file.chunkCount, size, name:"private.txt", url:`/api/rooms/${room}/files/${file.id}` }] } }, [channel.port2]);
+    await ready;
+    const response = await fetch(`/client-download/${token}`);
+    return { disposition:response.headers.get("Content-Disposition"), bytes:Array.from(new Uint8Array(await response.arrayBuffer())) };
+  }, { room, file:data.files[0], size:fileSecret.length });
+  const archivedBytes = Buffer.from(archived.bytes);
+  expect(archived.disposition).toContain("private-files.zip");
+  expect(archivedBytes.readUInt32LE(0)).toBe(0x04034b50);
+  expect(archivedBytes.readUInt32LE(archivedBytes.length - 22)).toBe(0x06054b50);
+  expect(archivedBytes.includes(Buffer.from("private.txt"))).toBe(true);
+  expect(archivedBytes.includes(fileSecret)).toBe(true);
 
   const downloadPromise = page.waitForEvent("download");
   await page.locator(".file-attachment").getByRole("button", { name:"Скачать" }).click();

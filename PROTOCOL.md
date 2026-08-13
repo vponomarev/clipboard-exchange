@@ -44,6 +44,7 @@ Protocol v5 публикует группу «необязательный те�
 ```text
 POST   /api/rooms/{room}/entries
 POST   /api/rooms/{room}/entries/{entry}/commit
+GET    /api/rooms/{room}/entries/{entry}/archive
 PUT    /api/rooms/{room}/entries/{entry}/pin
 DELETE /api/rooms/{room}/entries/{entry}
 POST   /api/rooms/{room}/clear
@@ -140,6 +141,13 @@ Protocol v4 объединяет текст и несколько файлов �
 Удаление `DELETE /api/rooms/{room}/entries/{entryId}` атомарно удаляет текстовую
 часть и метаданные всех файлов этой записи, после чего сервер очищает их объекты.
 Старые endpoints удаления отдельного item/file сохраняются для совместимости.
+
+`GET /api/rooms/{room}/entries/{entry}/archive` потоково формирует для открытой
+комнаты ZIP с методом Store, то есть без сжатия и без временной копии архива на
+диске. Имена очищаются от компонентов пути, совпадающие имена получают числовой
+суффикс. В encrypted room серверный endpoint архив не создаёт: клиент
+расшифровывает чанки и формирует такой же потоковый ZIP в Service Worker, поэтому
+сервер не получает открытые имена и содержимое.
 
 Открытый незашифрованный файл можно запросить с `?inline=1`. Сервер отвечает
 `Content-Disposition: inline` только для безопасных passive MIME types: plain

@@ -1,6 +1,7 @@
 package httpserver
 
 import (
+	"archive/zip"
 	"bytes"
 	"compress/zlib"
 	"context"
@@ -23,6 +24,7 @@ import (
 	"net/http"
 	"path"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -89,6 +91,7 @@ func NewWithVersion(cfg config.Config, db *store.Store, files *filestore.Store, 
 	mux.HandleFunc("GET /api/rooms/{room}", s.getRoom)
 	mux.HandleFunc("POST /api/rooms/{room}/entries", s.createEntry)
 	mux.HandleFunc("POST /api/rooms/{room}/entries/{entry}/commit", s.commitEntry)
+	mux.HandleFunc("GET /api/rooms/{room}/entries/{entry}/archive", s.downloadEntryArchive)
 	mux.HandleFunc("PUT /api/rooms/{room}/entries/{entry}/pin", s.pinEntry)
 	mux.HandleFunc("POST /api/rooms/{room}/clear", s.clearRoom)
 	mux.HandleFunc("POST /api/rooms/{room}/write-capability/rotate", s.rotateWriteCapability)
@@ -196,6 +199,7 @@ func (s *Server) capabilities(w http.ResponseWriter, _ *http.Request) {
 		"writeCapabilities":      true,
 		"openWriteRooms":         true,
 		"groupedAttachments":     true,
+		"entryArchives":          true,
 		"inlineFiles":            true,
 		"atomicEntries":          true,
 		"entryTTL":               true,
@@ -821,6 +825,114 @@ func (s *Server) downloadFile(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+}
+
+func (s *Server) downloadEntryArchive(w http.ResponseWriter, r *http.Request) {
+	roomID, entryID := r.PathValue("room"), r.PathValue("entry")
+	if !roomIDPattern.MatchString(roomID) || !objectIDPattern.MatchString(entryID) {
+		writeError(w, http.StatusBadRequest, "invalid_entry", "Invalid room or entry ID")
+		return
+	}
+	room, err := s.store.GetRoom(r.Context(), roomID)
+	if err != nil {
+		s.storeError(w, err)
+		return
+	}
+	if room.Encrypted {
+		writeError(w, http.StatusBadRequest, "encrypted_archive", "Encrypted archives must be created by the client")
+		return
+	}
+	visible, err := s.store.ListFiles(r.Context(), roomID)
+	if err != nil {
+		s.storeError(w, err)
+		return
+	}
+	entryFiles := make([]store.File, 0)
+	for _, file := range visible {
+		if file.EntryID == entryID {
+			entryFiles = append(entryFiles, file)
+		}
+	}
+	if len(entryFiles) == 0 {
+		writeError(w, http.StatusNotFound, "entry_not_found", "Entry or its files were not found")
+		return
+	}
+	sort.SliceStable(entryFiles, func(i, j int) bool { return entryFiles[i].EntryIndex < entryFiles[j].EntryIndex })
+
+	objects := make([]io.ReadCloser, 0, len(entryFiles))
+	for _, file := range entryFiles {
+		object, openErr := s.files.OpenObject(file.ID)
+		if openErr != nil {
+			for _, opened := range objects {
+				_ = opened.Close()
+			}
+			if errors.Is(openErr, fs.ErrNotExist) {
+				writeError(w, http.StatusNotFound, "file_missing", "A stored file is missing")
+			} else {
+				s.log.Printf("open archive file: %v", openErr)
+				writeError(w, http.StatusInternalServerError, "storage_unavailable", "Could not open stored files")
+			}
+			return
+		}
+		objects = append(objects, object)
+	}
+	defer func() {
+		for _, object := range objects {
+			_ = object.Close()
+		}
+	}()
+
+	w.Header().Set("Content-Type", "application/zip")
+	w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": "files-" + entryID[:8] + ".zip"}))
+	w.Header().Set("Cache-Control", "private, no-store")
+	archive := zip.NewWriter(w)
+	names := uniqueArchiveNames(entryFiles)
+	for index, file := range entryFiles {
+		header := &zip.FileHeader{Name: names[index], Method: zip.Store}
+		if created, parseErr := time.Parse(time.RFC3339Nano, file.CreatedAt); parseErr == nil {
+			header.SetModTime(created)
+		}
+		part, createErr := archive.CreateHeader(header)
+		if createErr != nil {
+			s.log.Printf("create archive member: %v", createErr)
+			return
+		}
+		if _, copyErr := io.Copy(part, objects[index]); copyErr != nil {
+			s.log.Printf("stream archive member: %v", copyErr)
+			return
+		}
+	}
+	if err := archive.Close(); err != nil {
+		s.log.Printf("close entry archive: %v", err)
+		return
+	}
+	entry, err := s.store.GetEntry(context.Background(), roomID, entryID)
+	if err == nil && entry.DeleteAfterDownload {
+		deleted, deleteErr := s.store.DeleteEntry(context.Background(), roomID, entryID)
+		if deleteErr == nil {
+			s.removeDeletedObjects(deleted)
+			s.hub.broadcast(roomID)
+		}
+	}
+}
+
+func uniqueArchiveNames(files []store.File) []string {
+	result := make([]string, len(files))
+	used := make(map[string]bool, len(files))
+	for index, file := range files {
+		name := path.Base(strings.ReplaceAll(file.Name, "\\", "/"))
+		if name == "." || name == "/" || name == "" {
+			name = "file"
+		}
+		candidate := name
+		for suffix := 2; used[strings.ToLower(candidate)]; suffix++ {
+			ext := path.Ext(name)
+			candidate = strings.TrimSuffix(name, ext) + " (" + strconv.Itoa(suffix) + ")" + ext
+		}
+		used[strings.ToLower(candidate)] = true
+		result[index] = candidate
+	}
+	return result
 }
 
 func (s *Server) deleteFile(w http.ResponseWriter, r *http.Request) {

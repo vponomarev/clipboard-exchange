@@ -199,7 +199,7 @@
         hadController = true;
       });
       try {
-        state.appRegistration = await navigator.serviceWorker.register("/assets/download-sw.js?v=11", { scope:"/" });
+        state.appRegistration = await navigator.serviceWorker.register("/assets/download-sw.js?v=13", { scope:"/" });
         observeAppRegistration(state.appRegistration);
       } catch (_) {}
     }
@@ -751,7 +751,18 @@
       }
       if (entry.files.length) {
         const attachments = document.createElement("div"); attachments.className = "attachments";
-        for (const attached of entry.files) attachments.append(renderFileAttachment(attached.file, attached.metadata));
+        if (entry.files.length > 1) {
+          attachments.classList.add("attachments-table-wrap");
+          const table=document.createElement("table"); table.className="attachments-table"; table.setAttribute("aria-label","Файлы сообщения");
+          const head=document.createElement("thead"), headRow=document.createElement("tr");
+          for (const title of ["Файл","Размер","Действия"]) { const cell=document.createElement("th"); cell.scope="col"; cell.textContent=title; headRow.append(cell); }
+          head.append(headRow);
+          const body=document.createElement("tbody");
+          for (const attached of entry.files) body.append(renderFileAttachment(attached.file,attached.metadata,true));
+          table.append(head,body); attachments.append(table);
+        } else {
+          attachments.append(renderFileAttachment(entry.files[0].file,entry.files[0].metadata));
+        }
         article.append(attachments);
       }
       const footer = document.createElement("div"); footer.className = "item-footer";
@@ -767,10 +778,14 @@
       const toggle = document.createElement("button"); toggle.type = "button"; toggle.className = "button secondary hidden"; toggle.dataset.action = "toggle"; toggle.textContent = "Развернуть"; toggle.setAttribute("aria-expanded", "false");
       const copy = document.createElement("button"); copy.type = "button"; copy.className = "button secondary"; copy.dataset.action = "copy"; copy.textContent = "Копировать";
 	  const copyAll = document.createElement("button"); copyAll.type="button"; copyAll.className="button secondary"; copyAll.dataset.action="copy-all"; copyAll.textContent="Копировать всё";
+	  const archive = document.createElement(state.room.encrypted ? "button" : "a"); archive.className="button primary"; archive.textContent="Скачать всё архивом";
+	  if (state.room.encrypted) { archive.type="button"; archive.dataset.action="encrypted-archive"; }
+	  else { archive.download=`files-${entry.id.slice(0,8)}.zip`; archive.href=`/api/rooms/${encodeURIComponent(state.roomID)}/entries/${entry.id}/archive`; }
 	  const pin = document.createElement("button"); pin.type="button"; pin.className="button secondary"; pin.dataset.action="pin"; pin.textContent=entry.pinned ? "Открепить" : "Закрепить";
       const del = document.createElement("button"); del.type = "button"; del.className = "button secondary delete"; del.dataset.action = "entry-delete"; del.textContent = "Удалить";
       if (entry.text) buttons.append(toggle, copy);
 	  if (entry.files.length) buttons.append(copyAll);
+	  if (entry.files.length > 1) buttons.append(archive);
 	  if (state.canWrite) buttons.append(pin);
       if (state.canWrite) buttons.append(del);
       footer.append(meta, buttons); article.append(footer); container.append(article);
@@ -795,6 +810,7 @@
     }
     if (button.dataset.action === "copy") { await copyText(article.querySelector("pre").textContent); toast("Текст скопирован"); return; }
 	if (button.dataset.action === "copy-all") { const entry=state.renderedEntries.find(value => value.id===article.dataset.id); const value=[entry?.text, ...(entry?.files || []).map(file => file.metadata.name)].filter(Boolean).join("\n"); await copyText(value); toast("Сообщение скопировано"); return; }
+	if (button.dataset.action === "encrypted-archive") { const entry=state.renderedEntries.find(value => value.id===article.dataset.id); await startEncryptedArchive(entry); return; }
 	if (button.dataset.action === "pin") { const entry=state.renderedEntries.find(value => value.id===article.dataset.id); button.disabled=true; try { await api(`/api/rooms/${encodeURIComponent(state.roomID)}/entries/${article.dataset.id}/pin`, { method:"PUT", body:JSON.stringify({ pinned:!entry?.pinned }), write:true }); await refresh(); } catch(error) { message("room-error",error.message); button.disabled=false; } return; }
     if (button.dataset.action === "file-copy") { await copyText(attachment.dataset.name); toast("Имя файла скопировано"); return; }
 	if (button.dataset.action === "preview") { const files=state.renderedEntries.flatMap(entry => entry.files).filter(value => canPreview(value.metadata.mimeType)); state.previewIndex=Math.max(0,files.findIndex(value => value.file.id===attachment.dataset.id)); await showPreview(state.previewIndex); return; }
@@ -813,14 +829,15 @@
     }
   }
 
-  function renderFileAttachment(file, metadata) {
-    const attachment = document.createElement("div"); attachment.className = "file-attachment"; attachment.dataset.id = file.id; attachment.dataset.name = metadata.name;
+  function renderFileAttachment(file, metadata, tableRow=false) {
+    const attachment = document.createElement(tableRow ? "tr" : "div"); attachment.className = `file-attachment${tableRow ? " file-attachment-row" : ""}`; attachment.dataset.id = file.id; attachment.dataset.name = metadata.name;
 	attachment.dataset.metadata = JSON.stringify(metadata);
-    const details = document.createElement("div"); details.className = "file-details";
+    const details = document.createElement(tableRow ? "td" : "div"); details.className = "file-details";
     const name = document.createElement("strong"); name.className = "file-name"; name.textContent = metadata.name;
-    const meta = document.createElement("div"); meta.className = "item-meta";
-    const size = document.createElement("span"); size.className = "muted"; size.textContent = formatBytes(file.encrypted ? metadata.size : file.size); meta.append(size);
-    details.append(name, meta);
+    const formattedSize=formatBytes(file.encrypted ? metadata.size : file.size);
+    if (tableRow) details.append(name);
+    else { const meta=document.createElement("div"); meta.className="item-meta"; const size=document.createElement("span"); size.className="muted"; size.textContent=formattedSize; meta.append(size); details.append(name,meta); }
+    const actionCell=tableRow ? document.createElement("td") : null;
     const buttons = document.createElement("div"); buttons.className = "item-buttons";
 	const open = document.createElement("button"); open.type="button"; open.className = "button secondary"; open.textContent = "Открыть"; open.dataset.action="preview";
     const download = document.createElement(file.encrypted ? "button" : "a"); download.className = "button primary"; download.textContent = "Скачать";
@@ -829,7 +846,8 @@
     const copy = document.createElement("button"); copy.type = "button"; copy.className = "button secondary"; copy.dataset.action = "file-copy"; copy.textContent = "Копировать имя";
     if (canPreview(metadata.mimeType)) buttons.append(open);
     buttons.append(download, copy);
-    attachment.append(details, buttons);
+    if (tableRow) { const sizeCell=document.createElement("td"); sizeCell.className="file-size muted"; sizeCell.textContent=formattedSize; actionCell.className="file-actions"; actionCell.append(buttons); attachment.append(details,sizeCell,actionCell); }
+    else attachment.append(details, buttons);
     return attachment;
   }
 
@@ -842,7 +860,7 @@
 
   async function ensureDownloadWorker() {
     if (!navigator.serviceWorker) throw new Error("Браузер не поддерживает потоковое скачивание зашифрованных файлов");
-    state.downloadRegistration = await navigator.serviceWorker.register("/assets/download-sw.js?v=11", { scope:"/" });
+    state.downloadRegistration = await navigator.serviceWorker.register("/assets/download-sw.js?v=13", { scope:"/" });
     await navigator.serviceWorker.ready;
     if (!navigator.serviceWorker.controller) {
       await new Promise((resolve, reject) => {
@@ -870,6 +888,20 @@
       if (inline) preview.location = `/client-download/${token}`;
       else { const frame = document.createElement("iframe"); frame.hidden = true; frame.src = `/client-download/${token}`; document.body.append(frame); setTimeout(() => frame.remove(), 60000); }
     } catch (error) { preview?.close(); message("room-error", error.message); }
+  }
+
+  async function startEncryptedArchive(entry) {
+	try {
+	  if (!state.key || !state.keyText.startsWith("ce1_")) throw new Error("Сначала откройте ключ комнаты");
+	  await ensureDownloadWorker();
+	  const token=uuid(), channel=new MessageChannel();
+	  const ready=new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(new Error("Service Worker не ответил")),5000);channel.port1.onmessage=()=>{clearTimeout(timer);resolve();};});
+	  const files=entry.files.map(({file,metadata})=>({ rawKey:state.keyText.slice(4), roomID:state.roomID, fileID:file.id, chunkSize:file.chunkSize, chunkCount:file.chunkCount, size:metadata.size, name:metadata.name, url:`/api/rooms/${encodeURIComponent(state.roomID)}/files/${file.id}` }));
+	  const consumeURL=entry.deleteAfterDownload ? `/api/rooms/${encodeURIComponent(state.roomID)}/files/${entry.files[0].file.id}/consume` : "";
+	  navigator.serviceWorker.controller.postMessage({ type:"prepare-archive", token, config:{ archive:true, name:`files-${entry.id.slice(0,8)}.zip`, files, consumeURL } }, [channel.port2]);
+	  await ready;
+	  const frame=document.createElement("iframe"); frame.hidden=true; frame.src=`/client-download/${token}`; document.body.append(frame); setTimeout(()=>frame.remove(),60000);
+	} catch(error) { message("room-error",error.message); }
   }
 
   async function prepareEncryptedURL(file, metadata, disposition="inline") {
