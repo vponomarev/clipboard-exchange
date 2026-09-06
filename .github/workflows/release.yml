@@ -92,7 +92,7 @@ jobs:
         run: |
           $version = $env:GITHUB_REF_NAME.TrimStart('v')
           $coreVersion = $version.Split('-')[0].Split('+')[0]
-          cmake -S . -B build-release -A x64 -DAPP_VERSION="$version"
+          cmake -S . -B build-release -A x64 "-DAPP_VERSION=$version"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cmake --build build-release --config Release
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

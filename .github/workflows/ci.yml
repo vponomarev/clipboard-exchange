@@ -92,13 +92,13 @@ jobs:
       - name: Build, unit test, and package native Win32 client
         shell: pwsh
         run: |
-          cmake -S . -B build-ci -A x64 -DAPP_VERSION=1.0.0
+          cmake -S . -B build-ci -A x64 "-DAPP_VERSION=1.0.0"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cmake --build build-ci --config Release
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           ctest --test-dir build-ci -C Release --output-on-failure
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          makensis /DAPP_VERSION=1.0.0 /DAPP_VERSION_NUMERIC=1.0.0.0 installer.nsi
+          makensis "/DAPP_VERSION=1.0.0" "/DAPP_VERSION_NUMERIC=1.0.0.0" installer.nsi
       - name: Test process lifecycle and deep links
         run: .\build\lifecycle-smoke.exe
       - name: Test cross-process UI Automation selection
