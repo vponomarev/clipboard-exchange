@@ -54,6 +54,7 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      - run: npm run test:unit
       - run: npx playwright install --with-deps chrome
       - run: npx playwright install --with-deps chromium firefox
       - run: npm run test:e2e
@@ -63,3 +64,57 @@ jobs:
           name: playwright-report
           path: playwright-report/
           retention-days: 7
+
+  desktop:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - run: npm ci
+      - run: npm test
+
+  windows-native:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: desktop/windows
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install NSIS
+        run: choco install nsis --yes --no-progress
+      - name: Build, unit test, and package native Win32 client
+        shell: pwsh
+        run: |
+          cmake -S . -B build-ci -A x64 -DAPP_VERSION=1.0.0
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build build-ci --config Release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ctest --test-dir build-ci -C Release --output-on-failure
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          makensis /DAPP_VERSION=1.0.0 /DAPP_VERSION_NUMERIC=1.0.0.0 installer.nsi
+      - name: Test process lifecycle and deep links
+        run: .\build\lifecycle-smoke.exe
+      - name: Test cross-process UI Automation selection
+        run: .\build\native-input-smoke.exe
+      - name: Enforce popup latency budget
+        shell: pwsh
+        run: |
+          $client = Start-Process .\build\clipboard-exchange-win32.exe -ArgumentList "--background" -WindowStyle Hidden -PassThru
+          try {
+            Start-Sleep -Milliseconds 500
+            .\build\picker-latency.exe
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } finally {
+            Stop-Process -Id $client.Id -Force -ErrorAction SilentlyContinue
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: clipboard-exchange-windows-x64
+          path: desktop/windows/build/clipboard-exchange-windows-x64-1.0.0-setup.exe

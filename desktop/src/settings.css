@@ -1,0 +1,20 @@
+:root { color-scheme:light dark; font-family:system-ui,-apple-system,"Segoe UI",sans-serif; background:#f4f7f6; color:#17312c; }
+* { box-sizing:border-box; }
+body { margin:0; min-height:100vh; display:grid; place-items:center; padding:28px; }
+main { width:min(620px,100%); }
+h1 { margin:0 0 8px; font-size:28px; }
+p { color:#5c6f6a; line-height:1.45; }
+form { display:grid; gap:14px; margin-top:24px; }
+label { display:grid; grid-template-columns:minmax(0,1fr) 245px; align-items:center; gap:18px; font-weight:620; }
+input { min-height:44px; border:1px solid #b7c7c3; border-radius:10px; padding:0 12px; background:#fff; color:#17312c; font:600 14px ui-monospace,monospace; text-align:center; cursor:pointer; }
+input:focus { outline:3px solid #46a28f55; border-color:#176b5b; }
+#error { min-height:22px; margin:0; color:#a42d2d; }
+.actions { display:flex; justify-content:flex-end; gap:10px; }
+button { min-height:42px; border:0; border-radius:10px; padding:0 18px; font-family:inherit; font-size:14px; font-weight:700; background:#176b5b; color:#fff; cursor:pointer; }
+button.secondary { background:#dce7e4; color:#17312c; }
+@media (prefers-color-scheme:dark) {
+  :root { background:#101a18; color:#edf7f4; }
+  p { color:#afc2bd; }
+  input { background:#172724; color:#edf7f4; border-color:#49635d; }
+  button.secondary { background:#30443f; color:#edf7f4; }
+}

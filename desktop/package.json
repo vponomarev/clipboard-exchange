@@ -1,0 +1,92 @@
+{
+  "name": "clipboard-exchange-desktop",
+  "version": "1.0.0",
+  "description": "Desktop client for Clipboard Exchange",
+  "license": "MIT",
+  "author": "Clipboard Exchange contributors",
+  "main": "src/main.cjs",
+  "scripts": {
+    "start": "electron .",
+    "prestart": "node scripts/build-windows-helper.cjs",
+    "test": "node --test test/*.test.cjs",
+    "dist": "electron-builder --publish never",
+    "predist": "node scripts/build-windows-helper.cjs",
+    "dist:win": "electron-builder --win --x64 --publish never",
+    "predist:win": "node scripts/build-windows-helper.cjs",
+    "dist:mac": "electron-builder --mac --universal --publish never",
+    "dist:linux": "electron-builder --linux --x64 --publish never"
+  },
+  "devDependencies": {
+    "electron": "43.4.0",
+    "electron-builder": "26.15.7"
+  },
+  "build": {
+    "appId": "com.clipboardexchange.desktop",
+    "productName": "Clipboard Exchange",
+    "asar": true,
+    "directories": {
+      "output": "dist"
+    },
+    "icon": "assets/icon.png",
+    "artifactName": "clipboard-exchange-${version}-${os}-${arch}.${ext}",
+    "files": [
+      "src/**/*",
+      "assets/**/*",
+      "package.json"
+    ],
+    "protocols": [
+      {
+        "name": "Clipboard Exchange room link",
+        "schemes": [
+          "clipboard-exchange"
+        ]
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.productivity",
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "universal"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "universal"
+          ]
+        }
+      ],
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false
+    },
+    "win": {
+      "extraResources": [
+        {
+          "from": "native/bin/clipboard-exchange-windows-helper.exe",
+          "to": "native/clipboard-exchange-windows-helper.exe"
+        }
+      ],
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "linux": {
+      "category": "Utility",
+      "target": [
+        "AppImage",
+        "deb"
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  }
+}

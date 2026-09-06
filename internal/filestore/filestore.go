@@ -10,13 +10,57 @@ import (
 	"path/filepath"
 	"regexp"
 	"strconv"
+	"sync"
 )
 
 var ErrConflict = errors.New("storage object conflict")
 var objectIDPattern = regexp.MustCompile(`^[0-9a-fA-F-]{36}$`)
 
 type Store struct {
-	root string
+	root      string
+	lifecycle sync.RWMutex
+}
+
+// BeginOperation protects the complete metadata/filesystem operation from maintenance.
+// Callers must acquire it before reading or creating metadata, not just before disk I/O.
+func (s *Store) BeginOperation() func() {
+	s.lifecycle.RLock()
+	return s.lifecycle.RUnlock
+}
+
+// Maintenance includes taking the reference snapshot as well as deleting objects.
+func (s *Store) Maintenance(work func()) {
+	s.lifecycle.Lock()
+	defer s.lifecycle.Unlock()
+	work()
+}
+
+// TryMaintenance avoids queueing an exclusive waiter behind a slow download:
+// an RWMutex writer waiter would also block every new request until it finishes.
+func (s *Store) TryMaintenance(work func()) bool {
+	if !s.lifecycle.TryLock() {
+		return false
+	}
+	defer s.lifecycle.Unlock()
+	work()
+	return true
+}
+
+func (s *Store) Check() error {
+	for _, name := range []string{"uploads", "objects"} {
+		dir := filepath.Join(s.root, name)
+		f, err := os.CreateTemp(dir, ".ready-*")
+		if err != nil {
+			return err
+		}
+		_, writeErr := f.Write([]byte("ready"))
+		closeErr := f.Close()
+		removeErr := os.Remove(f.Name())
+		if err := errors.Join(writeErr, closeErr, removeErr); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Store) Root() string { return s.root }

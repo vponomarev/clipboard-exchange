@@ -1,5 +1,32 @@
 const { test, expect } = require("@playwright/test");
 
+for (const encrypted of [false, true]) {
+  test(`download once preserves HEAD and consumes a complete ${encrypted ? "encrypted" : "plain"} file`, async ({ page, request }) => {
+    const room = `once-${crypto.randomUUID()}`;
+    await page.goto("/");
+    await page.locator("#room-id").fill(room);
+    if (encrypted) await page.locator("#encrypted").check();
+    await page.getByRole("button", { name:"Создать комнату" }).click();
+    await expect(page).toHaveURL(new RegExp(`/r/${room}`));
+    await openComposerSettings(page);
+    const bytes = Buffer.alloc(2*1024*1024+3, 65);
+    await selectFiles(page, { name:"once.txt", mimeType:"text/plain", buffer:bytes });
+    await page.locator("#delete-after-download").check();
+    await page.getByRole("button", { name:"Добавить", exact:true }).click();
+    await expect(page.locator(".file-attachment .file-name")).toHaveText("once.txt");
+    const snapshot = await (await request.get(`/api/rooms/${room}`)).json();
+    const fileURL = `/api/rooms/${room}/files/${snapshot.files[0].id}`;
+    expect((await request.head(fileURL)).status()).toBe(200);
+    expect((await (await request.get(`/api/rooms/${room}`)).json()).files).toHaveLength(1);
+    const pending = page.waitForEvent("download");
+    await page.locator(".file-attachment").getByRole(encrypted ? "button" : "link", {name:"Скачать",exact:true}).click();
+    const download = await pending, chunks = [];
+    for await (const chunk of await download.createReadStream()) chunks.push(chunk);
+    expect(Buffer.concat(chunks)).toEqual(bytes);
+    await expect.poll(async () => (await (await request.get(`/api/rooms/${room}`)).json()).files.length).toBe(0);
+  });
+}
+
 async function selectFiles(page, files, expected = Array.isArray(files) ? files.length : 1) {
   const rows = page.locator(".upload-row");
   await expect.poll(async () => {
@@ -123,6 +150,7 @@ test("plain room preserves multiline text and updates another client", async ({ 
   await page.getByRole("button", { name: "Добавить", exact: true }).click();
   await expect(second.locator(".item-content")).toHaveText(exact);
   await expect(second.locator(".item-alias")).toHaveText("Вася");
+  await expect.poll(() => second.evaluate(() => globalThis.clipboardExchangeDesktopMessages?.[0])).toMatchObject({ text: exact, alias: "Вася" });
   await expect(second.locator("#item-form")).toBeVisible();
   await expect(second.locator(".item .delete")).toHaveCount(1);
   await expect(second.getByText("В сети")).toBeVisible();

@@ -22,6 +22,7 @@ SQLite и весь интерфейс встроены в один бинарн�
 - HTTP, встроенный HTTPS или работа за nginx/HAProxy;
 - SQLite/WAL, TTL комнат и эксплуатационные лимиты;
 - installable PWA и Android Web Share Target, локальные recent/favorite rooms;
+- desktop-клиент для macOS и Windows: tray, global shortcut и системный clipboard;
 - поиск, фильтры, закрепление, уведомления, TTL записей и download-once;
 - атомарная публикация текста и всех файлов одним сообщением;
 - Prometheus metrics и CLI для status/rooms/backup/restore/reconcile;
@@ -66,7 +67,7 @@ SQLite и весь интерфейс встроены в один бинарн�
 --rate-limit=120               изменений с одного IP в минуту; 0 отключает
 --short-link-rate-limit=30     получений short-link envelope с IP в минуту
 --max-short-links=10000        максимум активных коротких ссылок
---trust-proxy=false            доверять Forwarded/X-Forwarded-For
+--trust-proxy=false            доверять последнему адресу X-Forwarded-For от proxy
 --files-dir=clipboard-exchange-files
 --max-file-bytes=524288000     максимум хранимых байт одного файла
 --max-room-file-bytes=524288000 квота файлов и reservations комнаты
@@ -152,6 +153,56 @@ curl -f http://127.0.0.1:8080/readyz
 PWA install, Web Share Target, чтение clipboard и notifications доступны браузеру
 только в secure context: используйте HTTPS (либо localhost при локальной проверке).
 
+## Desktop-приложения
+
+Нативный Windows-клиент находится в `desktop/windows`. Это компактное Win32
+приложение без Electron, PowerShell, .NET и runtime-зависимостей. Реализация для
+macOS пока остаётся в `desktop` как Electron-прототип и будет заменена отдельным
+нативным клиентом.
+
+Windows 1.0 поддерживает tray, автозапуск, уведомления, deep link
+`clipboard-exchange://connect?url=...`, настраиваемые глобальные хоткеи, E2EE и
+realtime-историю последних текстовых сообщений. URL комнаты и офлайн-кэш
+защищаются Windows DPAPI. Полный файловый UI открывается отдельной нативной
+кнопкой в браузере.
+
+Хоткеи по умолчанию:
+
+- `Cmd/Ctrl+Shift+Alt/Option+V` — отправить системный clipboard;
+- `Cmd/Ctrl+Shift+Alt/Option+S` — отправить выделенный в другом приложении текст;
+- `Cmd/Ctrl+Shift+Alt/Option+L` — показать последнее сообщение поверх окон;
+- `Cmd/Ctrl+Shift+Alt/Option+H` — открыть список последних сообщений, выбрать
+  стрелками и вставить клавишей Enter.
+
+Чтение выделения и вставка из мини-истории используют Accessibility/UI Automation
+и Unicode keyboard input, не читают и не изменяют системный clipboard. На macOS
+для этих двух действий нужно разрешить приложению Accessibility. Некоторые
+приложения не публикуют выделение через системный accessibility API; в этом случае
+desktop-клиент сообщает об ошибке. Приложение не отключает проверку TLS. В Windows
+ключ и write capability хранятся только в DPAPI-protected настройке и не попадают
+в логи; encryption key остаётся client-side.
+
+Сборка нативного Windows installer:
+
+```powershell
+cd desktop/windows
+cmake -S . -B build-release -A x64 -DAPP_VERSION=1.0.0
+cmake --build build-release --config Release
+ctest --test-dir build-release -C Release --output-on-failure
+makensis /DAPP_VERSION=1.0.0 /DAPP_VERSION_NUMERIC=1.0.0.0 installer.nsi
+```
+
+Сборка macOS-прототипа выполняется на macOS:
+
+```bash
+npm run dist:mac
+```
+
+Неподписанные artifacts автоматически собираются workflow релиза. Для публичной
+установки без системных предупреждений потребуются Apple Developer ID с
+notarization и Windows code-signing certificate; секреты должны храниться только
+в GitHub Actions secrets.
+
 Кнопка «Версия» в верхней панели показывает отдельно версию загруженного Web UI и
 версию работающего сервера. «Проверить обновление» принудительно запускает проверку
 Service Worker. Когда новый app shell загружен, появляется кнопка «Перезапустить»;
@@ -187,7 +238,8 @@ location / {
     proxy_pass http://127.0.0.1:8080;
     proxy_http_version 1.1;
     proxy_set_header Host $host;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-For $remote_addr;
+    proxy_set_header Forwarded "";
     proxy_set_header X-Forwarded-Proto $scheme;
     proxy_set_header Upgrade $http_upgrade;
     proxy_set_header Connection "upgrade";
@@ -196,6 +248,26 @@ location / {
 
 При rate limiting по реальному адресу клиента запускайте сервер с
 `--trust-proxy` только если к нему нельзя подключиться в обход доверенного proxy.
+Сервер использует последний IP в X-Forwarded-For и игнорирует Forwarded.
+Для нескольких proxy настройте на последнем доверенном узле определение реального
+адреса и перезапись X-Forwarded-For; иначе лимит будет общим для предыдущего proxy.
+
+Download-once доступен только для одного файла без текста. Удаление выполняется
+после успешной полной передачи; HEAD, Range, предпросмотр и ошибки передачи файл
+не удаляют. Шифрованный клиент подтверждает получение после чтения всего потока.
+Это best-effort подтверждение передачи браузеру, а не гарантия записи на диск и
+не запрет параллельного скачивания. При отмене или потере подтверждения файл
+может остаться доступным до удаления вручную или по TTL.
+
+`/healthz` проверяет, что HTTP-процесс отвечает. `/readyz` проверяет чтение БД и
+возможность записи в файловое хранилище; при отказе возвращает 503. Проверка
+ограничена двумя секундами, результаты кэшируются на одну секунду.
+
+Обновление автоматически переводит SQLite на схему 7 для сохранения результатов
+завершённых uploads. Перед обновлением сделайте backup: старый сервер не откроет
+схему 7. Обновлённый Windows-клиент использует endpoint `/history` — сервер нужно
+обновить первым. Очистка хранилища внутри сервера синхронизирована с запросами;
+CLI `storage reconcile`, как backup/restore, запускайте при остановленном сервисе.
 
 ## Права доступа и alias
 
@@ -259,7 +331,7 @@ capability. Человеческий пароль может быть подоб
 
 ## Разработка и тесты
 
-Требуется Go 1.24 или новее. Для browser e2e также нужны Node.js и Playwright:
+Требуется Go 1.24 или новее. Для browser e2e и desktop-клиента также нужен Node.js:
 
 ```bash
 go test ./...
@@ -267,6 +339,7 @@ go vet ./...
 npm ci
 npx playwright install chrome firefox chromium
 npm run test:e2e
+cd desktop && npm ci && npm test
 ```
 
 Тесты Playwright покрывают Chrome, Firefox и Android Chrome viewport: создание

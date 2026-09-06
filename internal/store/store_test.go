@@ -162,7 +162,7 @@ func TestVersionFiveDatabaseAddsShortLinks(t *testing.T) {
 	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='short_links'`).Scan(&tables); err != nil {
 		t.Fatal(err)
 	}
-	if version != 6 || tables != 1 {
+	if version != 7 || tables != 1 {
 		t.Fatalf("version=%d short_links=%d", version, tables)
 	}
 }

@@ -738,6 +738,11 @@
 	const metadataByID = new Map(state.entries.map(entry => [entry.id, entry]));
 	for (const entry of entries.values()) Object.assign(entry, metadataByID.get(entry.id) || { pinned:false, expiresAt:"", deleteAfterDownload:false });
     for (const entry of entries.values()) entry.files.sort((left, right) => (left.file.entryIndex || 0) - (right.file.entryIndex || 0));
+	globalThis.clipboardExchangeDesktopMessages = Array.from(entries.values())
+	  .filter(entry => Boolean(entry.text))
+	  .sort((left, right) => new Date(right.createdAt) - new Date(left.createdAt))
+	  .slice(0, 30)
+	  .map(entry => ({ text:entry.text, alias:entry.alias || "", createdAt:entry.createdAt }));
 	const query = $("search").value.trim().toLocaleLowerCase(); const filter = $("type-filter").value;
 	const matchesType = entry => filter === "all" || (filter === "text" && Boolean(entry.text)) || (filter === "files" && entry.files.length>0) || (filter === "images" && entry.files.some(value => String(value.metadata.mimeType).startsWith("image/"))) || (filter === "documents" && entry.files.some(value => !String(value.metadata.mimeType).startsWith("image/") && !String(value.metadata.mimeType).startsWith("audio/") && !String(value.metadata.mimeType).startsWith("video/")));
 	const matchesQuery = entry => !query || [entry.text, entry.alias, ...entry.files.map(value => value.metadata.name)].some(value => String(value || "").toLocaleLowerCase().includes(query));

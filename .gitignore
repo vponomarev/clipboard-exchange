@@ -3,6 +3,11 @@
 /.gocache/
 /bin/
 /dist/
+/desktop/dist/
+/desktop/node_modules/
+/desktop/native/bin/
+/desktop/windows/build/
+/desktop/windows/build-*/
 /data/
 /test-results/
 /playwright-report/

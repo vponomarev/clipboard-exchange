@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -145,7 +146,7 @@ func Open(path string) (*Store, error) {
 			db.Close()
 			return nil, errors.New("legacy database schema is unsupported; archive it and start with an empty database")
 		}
-	} else if version != 2 && version != 3 && version != 4 && version != 5 && version != 6 {
+	} else if version != 2 && version != 3 && version != 4 && version != 5 && version != 6 && version != 7 {
 		db.Close()
 		return nil, fmt.Errorf("unsupported database schema version %d", version)
 	}
@@ -345,7 +346,16 @@ func Open(path string) (*Store, error) {
 			created_at TEXT NOT NULL
 		)`,
 		`CREATE INDEX IF NOT EXISTS short_links_expiry ON short_links(expires_at)`,
-		`PRAGMA user_version=6`,
+		`CREATE TABLE IF NOT EXISTS completed_uploads (
+			id TEXT PRIMARY KEY,
+			room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+			file_id TEXT NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+			token_hash TEXT NOT NULL,
+			expires_at TEXT NOT NULL,
+			response TEXT NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS completed_uploads_expiry ON completed_uploads(expires_at)`,
+		`PRAGMA user_version=7`,
 	} {
 		if _, err := db.Exec(stmt); err != nil {
 			db.Close()
@@ -356,6 +366,30 @@ func Open(path string) (*Store, error) {
 }
 
 func (s *Store) Close() error { return s.db.Close() }
+
+func (s *Store) Ping(ctx context.Context) error {
+	var value int
+	return s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM rooms LIMIT 1)`).Scan(&value)
+}
+
+// CompletedUpload preserves the original capability and response until upload expiry.
+func (s *Store) CompletedUpload(ctx context.Context, roomID, uploadID, hash string) (File, error) {
+	var expected, payload string
+	err := s.db.QueryRowContext(ctx, `SELECT token_hash,response FROM completed_uploads WHERE id=? AND room_id=? AND expires_at>?`, uploadID, roomID, time.Now().UTC().Format(time.RFC3339Nano)).Scan(&expected, &payload)
+	if errors.Is(err, sql.ErrNoRows) {
+		return File{}, ErrNotFound
+	}
+	if err != nil {
+		return File{}, err
+	}
+	if subtle.ConstantTimeCompare([]byte(hash), []byte(expected)) != 1 {
+		return File{}, ErrForbidden
+	}
+	var file File
+	err = json.Unmarshal([]byte(payload), &file)
+	file.RoomID = roomID
+	return file, err
+}
 
 func (s *Store) CreateShortLink(ctx context.Context, link ShortLink, maxActive int) error {
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -475,14 +509,26 @@ func (s *Store) GetRoom(ctx context.Context, id string) (Room, error) {
 }
 
 func (s *Store) ListItems(ctx context.Context, roomID string) ([]Item, error) {
+	return s.listItems(ctx, roomID, -1, false)
+}
+
+func (s *Store) RecentItems(ctx context.Context, roomID string, limit int) ([]Item, error) {
+	return s.listItems(ctx, roomID, limit, true)
+}
+
+func (s *Store) listItems(ctx context.Context, roomID string, limit int, recent bool) ([]Item, error) {
 	if _, err := s.GetRoom(ctx, roomID); err != nil {
 		return nil, err
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
+	order := "COALESCE(e.pinned,0) DESC,i.created_at DESC,i.id DESC"
+	if recent {
+		order = "i.created_at DESC,i.id DESC"
+	}
 	rows, err := s.db.QueryContext(ctx, `SELECT i.id,i.kind,i.content,i.alias,i.ciphertext,i.iv,i.key_id,i.version,i.created_at
 		FROM items i LEFT JOIN entries e ON e.room_id=i.room_id AND e.id=i.id
 		WHERE i.room_id=? AND (e.id IS NULL OR (e.published=1 AND (e.expires_at='' OR e.expires_at>?)))
-		ORDER BY COALESCE(e.pinned,0) DESC,i.created_at DESC,i.id DESC`, roomID, now)
+		ORDER BY `+order+` LIMIT ?`, roomID, now, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -958,6 +1004,13 @@ func (s *Store) CompleteUpload(ctx context.Context, roomID, uploadID, manifestCi
 		}
 		return File{}, err
 	}
+	payload, err := json.Marshal(file)
+	if err != nil {
+		return File{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO completed_uploads(id,room_id,file_id,token_hash,expires_at,response) SELECT id,room_id,file_id,token_hash,expires_at,? FROM uploads WHERE id=?`, string(payload), uploadID); err != nil {
+		return File{}, err
+	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM uploads WHERE id=?`, uploadID); err != nil {
 		return File{}, err
 	}
@@ -1142,6 +1195,9 @@ func (s *Store) ClearRoom(ctx context.Context, roomID string) (DeletedObjects, e
 }
 
 func (s *Store) DeleteExpiredUploads(ctx context.Context, before time.Time) ([]string, error) {
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM completed_uploads WHERE expires_at<=?`, before.UTC().Format(time.RFC3339Nano)); err != nil {
+		return nil, err
+	}
 	rows, err := s.db.QueryContext(ctx, `SELECT id FROM uploads WHERE expires_at < ?`, before.UTC().Format(time.RFC3339Nano))
 	if err != nil {
 		return nil, err

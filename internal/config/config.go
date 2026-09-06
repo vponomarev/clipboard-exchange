@@ -62,7 +62,7 @@ func BindFlags(fs *flag.FlagSet, cfg *Config) {
 	fs.IntVar(&cfg.RateLimit, "rate-limit", cfg.RateLimit, "mutating requests per IP per minute (0 disables)")
 	fs.IntVar(&cfg.ShortLinkRateLimit, "short-link-rate-limit", cfg.ShortLinkRateLimit, "short-link retrieval requests per IP per minute (0 disables)")
 	fs.IntVar(&cfg.MaxShortLinks, "max-short-links", cfg.MaxShortLinks, "maximum active short links")
-	fs.BoolVar(&cfg.TrustProxy, "trust-proxy", false, "trust Forwarded and X-Forwarded-* headers")
+	fs.BoolVar(&cfg.TrustProxy, "trust-proxy", false, "trust the last X-Forwarded-For address set by the immediate proxy")
 	fs.StringVar(&cfg.FilesDir, "files-dir", cfg.FilesDir, "directory for uploaded files and temporary chunks")
 	fs.Int64Var(&cfg.MaxFileBytes, "max-file-bytes", cfg.MaxFileBytes, "maximum stored bytes per file")
 	fs.Int64Var(&cfg.MaxRoomFileBytes, "max-room-file-bytes", cfg.MaxRoomFileBytes, "maximum stored file bytes per room, including reservations")

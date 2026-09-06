@@ -19,12 +19,16 @@ jobs:
           go-version: "1.24.x"
           cache: true
       - name: Test
-        run: go test ./...
+        run: |
+          go test ./...
+          go vet ./...
+          go test -race ./...
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
       - run: npm ci
+      - run: npm run test:unit
       - run: npx playwright install --with-deps chrome
       - run: npx playwright install --with-deps chromium firefox
       - name: Browser end-to-end tests
@@ -40,7 +44,125 @@ jobs:
           cp README.md PROTOCOL.md THIRD_PARTY_NOTICES.md dist/clipboard-exchange-linux-amd64/
           tar -C dist -czf dist/clipboard-exchange-linux-amd64.tar.gz clipboard-exchange-linux-amd64
           cd dist && sha256sum clipboard-exchange-linux-amd64.tar.gz > checksums.txt
-      - name: Publish GitHub Release
+      - name: Create draft GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/clipboard-exchange-linux-amd64.tar.gz dist/checksums.txt --generate-notes --verify-tag
+        run: gh release create "$GITHUB_REF_NAME" dist/clipboard-exchange-linux-amd64.tar.gz dist/checksums.txt --draft --title "$GITHUB_REF_NAME" --notes-file RELEASE_NOTES.md --verify-tag
+
+  mac-desktop:
+    needs: release
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - run: npm ci
+      - run: npm test
+      - name: Match desktop version to tag
+        shell: bash
+        run: npm version --no-git-tag-version --allow-same-version "${GITHUB_REF_NAME#v}"
+      - name: Build desktop artifact
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: npm run dist:mac
+      - name: Upload to GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: find dist -maxdepth 1 -type f \( -name '*.dmg' -o -name '*.zip' -o -name '*.blockmap' -o -name '*-mac.yml' \) -exec gh release upload "$GITHUB_REF_NAME" '{}' --clobber \;
+
+  windows-native:
+    needs: release
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: desktop/windows
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native build tools
+        run: choco install nsis --yes --no-progress
+      - name: Build, test, and package
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME.TrimStart('v')
+          $coreVersion = $version.Split('-')[0].Split('+')[0]
+          cmake -S . -B build-release -A x64 -DAPP_VERSION="$version"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build build-release --config Release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ctest --test-dir build-release -C Release --output-on-failure
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\build\lifecycle-smoke.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\build\native-input-smoke.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $client = Start-Process .\build\clipboard-exchange-win32.exe -ArgumentList "--background" -WindowStyle Hidden -PassThru
+          try {
+            Start-Sleep -Milliseconds 500
+            .\build\picker-latency.exe
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } finally {
+            Stop-Process -Id $client.Id -Force -ErrorAction SilentlyContinue
+          }
+      - name: Sign when certificate is configured and package installer
+        shell: pwsh
+        env:
+          WINDOWS_SIGNING_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_BASE64 }}
+          WINDOWS_SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_PASSWORD }}
+        run: |
+          $version = $env:GITHUB_REF_NAME.TrimStart('v')
+          $coreVersion = $version.Split('-')[0].Split('+')[0]
+          $certificate = Join-Path $env:RUNNER_TEMP "clipboard-exchange-signing.pfx"
+          $signTool = $null
+          try {
+            if ($env:WINDOWS_SIGNING_CERTIFICATE_BASE64) {
+              [IO.File]::WriteAllBytes($certificate, [Convert]::FromBase64String($env:WINDOWS_SIGNING_CERTIFICATE_BASE64))
+              $signTool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
+                Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+              if (!$signTool) { throw "signtool.exe was not found" }
+              & $signTool sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com /f $certificate /p $env:WINDOWS_SIGNING_CERTIFICATE_PASSWORD build\clipboard-exchange-win32.exe
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            }
+            makensis "/DAPP_VERSION=$version" "/DAPP_VERSION_NUMERIC=$coreVersion.0" installer.nsi
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            if ($signTool) {
+              $artifact = "build/clipboard-exchange-windows-x64-$version-setup.exe"
+              & $signTool sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com /f $certificate /p $env:WINDOWS_SIGNING_CERTIFICATE_PASSWORD $artifact
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+              & $signTool verify /pa /all $artifact
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            }
+          } finally {
+            Remove-Item -LiteralPath $certificate -Force -ErrorAction SilentlyContinue
+          }
+      - name: Create checksum
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME.TrimStart('v')
+          $artifact = "build/clipboard-exchange-windows-x64-$version-setup.exe"
+          $hash = (Get-FileHash $artifact -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $(Split-Path $artifact -Leaf)" | Set-Content "$artifact.sha256" -Encoding ascii
+      - name: Upload native Windows release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = $env:GITHUB_REF_NAME.TrimStart('v')
+          $artifact = "build/clipboard-exchange-windows-x64-$version-setup.exe"
+          gh release upload $env:GITHUB_REF_NAME $artifact "$artifact.sha256" --clobber
+
+  publish:
+    needs: [release, mac-desktop, windows-native]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish complete release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release edit "$GITHUB_REF_NAME" --draft=false --latest

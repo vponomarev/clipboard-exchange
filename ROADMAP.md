@@ -32,11 +32,14 @@ client-side расшифрование и очистка storage.
 - дисковые квоты и защита от исчерпания места;
 - инкрементальные события и пагинация истории комнаты.
 
-## Фаза 3 — нативные Android и macOS приложения
+## Фаза 3 — desktop-приложения
 
-Статус: запланирована. Рекомендуемый подход — два небольших нативных клиента к
-тому же HTTP/WebSocket API: Kotlin + Jetpack Compose для Android и Swift + SwiftUI
-для macOS. WebView не используется как основная архитектура.
+Статус: Electron-клиент использован как функциональный прототип. После проверки
+UX принято решение выпускать отдельные нативные клиенты, начиная с Win32 C++ для
+Windows; macOS и Linux получат собственные реализации позднее. Для Android принят
+существующий installable PWA с Web Share Target. Все клиенты используют один
+HTTP/WebSocket protocol, но системная интеграция, popup и hotkey path остаются
+полностью нативными.
 
 ### Общая подготовка
 
@@ -54,69 +57,64 @@ client-side расшифрование и очистка storage.
   установку/выбор доверенного сертификата;
 - предусмотреть локализацию RU/EN и accessibility.
 
-### Android
+### Desktop MVP
 
-- создать Gradle-проект на Kotlin с Jetpack Compose;
-- реализовать подключение к комнате, список записей, add/copy/delete и real-time;
-- реализовать QR scanner и обработку ссылок комнаты;
-- добавить Android Sharesheet: отправка выделенного текста и файлов в комнату;
-- добавить системные действия «копировать» и «поделиться» для записи;
-- учитывать ограничения Android clipboard/background execution;
-- реализовать шифрование, совместимое с Web UI;
-- после фазы 2 добавить загрузку, скачивание и шаринг файлов;
-- добавить unit, contract и Compose UI tests;
-- проверить телефоны/планшеты, portrait/landscape, светлую/тёмную темы;
-- настроить signed APK/AAB, GitHub Actions и публикацию в GitHub Releases;
-- при необходимости подготовить Google Play listing и privacy policy.
-
-### macOS
-
-- создать Swift/SwiftUI-проект;
-- реализовать подключение к комнате, add/copy/delete и real-time;
-- сделать обычное окно и опциональный menu bar режим;
-- добавить global shortcut для отправки текущего clipboard по явному действию;
-- поддержать открытие room/deep links и QR-код через камеру или изображение;
-- реализовать шифрование, совместимое с Web UI, с хранением ключей в Keychain;
-- добавить drag-and-drop и Share Extension после завершения файловой фазы;
-- добавить unit, contract и XCUITest smoke tests;
-- проверить Intel и Apple Silicon либо выпускать universal binary;
-- настроить code signing, hardened runtime, notarization и GitHub Actions release;
-- при необходимости подготовить Mac App Store listing и sandbox entitlements.
+- [x] создать общий Electron-проект и безопасный экран подключения к серверу;
+- [x] сохранить совместимость add/copy/delete, files, encryption и real-time через Web UI;
+- [x] добавить обычное окно, tray/menu bar и global shortcut явной отправки clipboard;
+- [x] добавить настройку четырёх глобальных хоткеев с проверкой конфликтов;
+- [x] отправлять выделенный текст через Accessibility/UI Automation без clipboard;
+- [x] показывать последнее сообщение в non-activating overlay;
+- [x] добавить keyboard-friendly mini picker последних сообщений для вставки без clipboard;
+- [x] зарегистрировать `clipboard-exchange://` deep links;
+- [x] добавить unit tests URL/deep-link boundary и CI;
+- [x] создать автономный Win32 shell без Electron, PowerShell и .NET;
+- [x] перенести tray, настройки и четыре hotkey на WinAPI `RegisterHotKey`;
+- [x] реализовать быстрый заранее созданный history popup и вставку через `SendInput`;
+- [x] получать выделенный текст напрямую через COM UI Automation без clipboard;
+- [x] подключить к Win32-клиенту WinHTTP REST transport, capability auth и кэш сообщений;
+- [x] заменить двухсекундный polling нативным WinHTTP WebSocket reconnect;
+- [x] заменить Electron Windows artifact нативным установщиком после parity;
+- [x] подготовить финальный Windows `.ico` asset;
+- [ ] добавить нативный Share Extension на macOS и Share target на Windows;
+- [ ] подписать и notarize universal macOS artifact;
+- [ ] подписать Windows installer;
+- [ ] добавить Linux AppImage/deb в release matrix после ручной проверки;
 
 ### Definition of Done фазы 3
 
-- Android и macOS клиенты совместимы с Web UI в одной комнате;
-- текст и шифрованные записи одинаково читаются всеми тремя клиентами;
-- real-time, reconnect, QR/deep links и системный share flow протестированы;
+- Android PWA и desktop-клиенты совместимы с Web UI в одной комнате;
+- текст, файлы и шифрованные записи одинаково читаются всеми клиентами;
+- real-time, reconnect, QR/deep links и системный clipboard flow протестированы;
 - после фазы 2 обеспечена совместимость файлов и их шифрования;
 - ключи не попадают в логи, аналитику, crash reports или серверные запросы;
-- Android APK/AAB и подписанный/notarized macOS artifact собираются в CI;
+- Windows installer и подписанный/notarized macOS artifact собираются в CI;
 - опубликованы первые стабильные GitHub Releases и инструкции установки;
 - выполнена ручная проверка на реальном Android-устройстве и Mac.
 
 ### Что потребуется от владельца проекта
 
-- выбрать bundle/application IDs, например `com.example.clipboardexchange`;
+- утвердить текущий application ID `com.clipboardexchange.desktop`;
 - предоставить название приложения, иконку и желаемые цвета либо утвердить их
   разработку;
-- определить минимальные версии Android и macOS;
-- решить, достаточно ли GitHub Releases или нужна публикация в Google Play и
-  Mac App Store;
-- для store-релизов предоставить Google Play Console и Apple Developer accounts;
-- безопасно передать Android signing key и Apple signing/notarization credentials
+- определить минимальные версии macOS и Windows;
+- решить, достаточно ли GitHub Releases или нужна публикация в Mac App Store и
+  Microsoft Store;
+- для store-релизов предоставить Apple Developer и Microsoft Partner accounts;
+- безопасно передать Apple signing/notarization и Windows signing credentials
   через GitHub Actions secrets — не добавлять их в репозиторий;
-- предоставить Android-устройство и Mac для финальной ручной приёмки;
+- предоставить Mac и отдельную Windows-машину/VM для финальной ручной приёмки;
 - решить, должны ли приложения запоминать комнаты и ключи по умолчанию;
 - определить отношение к self-signed TLS и корпоративным/домашним CA;
-- утвердить, нужен ли macOS menu bar режим и global shortcut в первом MVP.
+- утвердить четыре системных shortcut и проверить Accessibility-разрешение на macOS.
 
 ### Предлагаемый порядок реализации
 
-1. Protocol specification, capabilities endpoint и encryption test vectors.
-2. Android text-only MVP и GitHub APK release.
-3. macOS text-only MVP и signed/notarized GitHub release.
-4. Общие contract tests и cross-client interoperability matrix.
-5. Подключение файлов после стабилизации фазы 2.
+1. Desktop wrapper MVP для macOS/Windows с tray, clipboard и deep links.
+2. CI artifacts, финальные иконки и ручная проверка обеих ОС.
+3. Signing/notarization и GitHub Release.
+4. Нативные системные share extensions.
+5. Linux AppImage/deb и ручная проверка desktop environments.
 6. Store publication, если она требуется.
 
 ## Фаза 2.5 — productivity и эксплуатация

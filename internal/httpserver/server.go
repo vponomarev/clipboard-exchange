@@ -27,6 +27,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -54,16 +55,21 @@ const (
 )
 
 type Server struct {
-	cfg          config.Config
-	store        *store.Store
-	files        *filestore.Store
-	log          *log.Logger
-	hub          *hub
-	limiter      *rateLimiter
-	shortLimiter *rateLimiter
-	static       http.Handler
-	started      time.Time
-	version      string
+	cfg           config.Config
+	store         *store.Store
+	files         *filestore.Store
+	log           *log.Logger
+	hub           *hub
+	limiter       *rateLimiter
+	shortLimiter  *rateLimiter
+	static        http.Handler
+	started       time.Time
+	version       string
+	uploadLocks   [64]sync.Mutex
+	readinessMu   sync.Mutex
+	readinessDone chan struct{}
+	readinessAt   time.Time
+	readinessErr  error
 }
 
 type roomResponse struct {
@@ -82,13 +88,14 @@ func NewWithVersion(cfg config.Config, db *store.Store, files *filestore.Store, 
 	s := &Server{cfg: cfg, store: db, files: files, log: logger, hub: newHub(), limiter: newRateLimiter(cfg.RateLimit), shortLimiter: newRateLimiter(cfg.ShortLinkRateLimit), static: http.FileServer(http.FS(assets)), started: time.Now(), version: version}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
-	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
+	mux.HandleFunc("GET /readyz", s.ready)
 	mux.HandleFunc("GET /api/capabilities", s.capabilities)
 	mux.HandleFunc("POST /api/short-links", s.createShortLink)
 	mux.HandleFunc("GET /api/short-links/{code}", s.getShortLink)
 	mux.HandleFunc("POST /api/short-links/{code}/redeem", s.redeemShortLink)
 	mux.HandleFunc("POST /api/rooms", s.createRoom)
 	mux.HandleFunc("GET /api/rooms/{room}", s.getRoom)
+	mux.HandleFunc("GET /api/rooms/{room}/history", s.history)
 	mux.HandleFunc("POST /api/rooms/{room}/entries", s.createEntry)
 	mux.HandleFunc("POST /api/rooms/{room}/entries/{entry}/commit", s.commitEntry)
 	mux.HandleFunc("GET /api/rooms/{room}/entries/{entry}/archive", s.downloadEntryArchive)
@@ -116,7 +123,7 @@ func NewWithVersion(cfg config.Config, db *store.Store, files *filestore.Store, 
 	mux.HandleFunc("GET /share-target", s.page)
 	mux.HandleFunc("POST /share-target", s.shareTargetFallback)
 	mux.HandleFunc("GET /", s.page)
-	return s.security(s.logging(mux))
+	return s.security(s.logging(s.storageOperations(mux)))
 }
 
 func (s *Server) page(w http.ResponseWriter, r *http.Request) {
@@ -194,25 +201,27 @@ func (s *Server) createRoom(w http.ResponseWriter, r *http.Request) {
 func (s *Server) capabilities(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusOK, map[string]any{
-		"serverVersion":          s.version,
-		"protocolVersion":        6,
-		"writeCapabilities":      true,
-		"openWriteRooms":         true,
-		"groupedAttachments":     true,
-		"entryArchives":          true,
-		"inlineFiles":            true,
-		"atomicEntries":          true,
-		"entryTTL":               true,
-		"roomTTL":                true,
-		"pwa":                    true,
-		"qrScanner":              true,
-		"shortLinks":             true,
-		"shortLinkKDFIterations": shortLinkKDFIterations,
-		"aliases":                true,
-		"encryptedTextVersions":  []int{1, 2},
-		"files":                  true,
-		"encryptedFiles":         true,
-		"fileEncryptionVersions": []int{1},
+		"serverVersion":              s.version,
+		"protocolVersion":            6,
+		"writeCapabilities":          true,
+		"openWriteRooms":             true,
+		"groupedAttachments":         true,
+		"entryArchives":              true,
+		"inlineFiles":                true,
+		"atomicEntries":              true,
+		"entryTTL":                   true,
+		"roomTTL":                    true,
+		"pwa":                        true,
+		"qrScanner":                  true,
+		"shortLinks":                 true,
+		"boundedHistory":             true,
+		"idempotentUploadCompletion": true,
+		"shortLinkKDFIterations":     shortLinkKDFIterations,
+		"aliases":                    true,
+		"encryptedTextVersions":      []int{1, 2},
+		"files":                      true,
+		"encryptedFiles":             true,
+		"fileEncryptionVersions":     []int{1},
 		"limits": map[string]any{
 			"maxItemBytes":     s.cfg.MaxItemBytes,
 			"maxItemsPerRoom":  s.cfg.MaxItemsPerRoom,
@@ -658,6 +667,12 @@ func (s *Server) getUpload(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) putChunk(w http.ResponseWriter, r *http.Request) {
+	w = newTransferWriter(w)
+	unlock := s.lockUpload(r.PathValue("upload"))
+	defer unlock()
+	rc := http.NewResponseController(w)
+	_ = rc.SetWriteDeadline(time.Time{})
+	defer func() { _ = rc.SetWriteDeadline(time.Now().Add(transferIdleTimeout)) }()
 	upload, ok := s.authorizeUpload(w, r)
 	if !ok {
 		return
@@ -685,7 +700,7 @@ func (s *Server) putChunk(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	size, digest, prefix, err := s.files.WriteChunk(upload.ID, index, r.Body, expected)
+	size, digest, prefix, err := s.files.WriteChunk(upload.ID, index, transferReader{r.Body, rc}, expected)
 	if errors.Is(err, filestore.ErrConflict) {
 		writeError(w, http.StatusConflict, "chunk_conflict", "A different chunk already exists at this index")
 		return
@@ -716,6 +731,12 @@ func (s *Server) putChunk(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) completeUpload(w http.ResponseWriter, r *http.Request) {
+	w = newTransferWriter(w)
+	unlock := s.lockUpload(r.PathValue("upload"))
+	defer unlock()
+	if s.completedUpload(w, r) {
+		return
+	}
 	upload, ok := s.authorizeUpload(w, r)
 	if !ok {
 		return
@@ -748,7 +769,8 @@ func (s *Server) completeUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	file, err := s.store.CompleteUpload(r.Context(), upload.RoomID, upload.ID, manifest.Ciphertext, manifest.IV, manifest.Version)
 	if err != nil {
-		_ = s.files.RemoveObject(upload.FileID)
+		// Leave the object for maintenance: a failed/ambiguous commit must never
+		// remove an object that another successful operation owns.
 		if errors.Is(err, store.ErrConflict) {
 			writeError(w, http.StatusConflict, "incomplete_upload", "Upload metadata is incomplete")
 			return
@@ -765,6 +787,8 @@ func (s *Server) completeUpload(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) abortUpload(w http.ResponseWriter, r *http.Request) {
+	unlock := s.lockUpload(r.PathValue("upload"))
+	defer unlock()
 	upload, ok := s.authorizeUpload(w, r)
 	if !ok {
 		return
@@ -811,13 +835,14 @@ func (s *Server) downloadFile(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Disposition", mime.FormatMediaType(disposition, map[string]string{"filename": filename}))
 	w.Header().Set("ETag", `"`+file.ID+`"`)
 	w.Header().Set("Cache-Control", "private, no-store")
-	http.ServeContent(w, r, file.Name, created, object)
+	transfer := newTransferWriter(w)
+	http.ServeContent(transfer, r, file.Name, created, object)
 	if err := object.Close(); err != nil {
 		s.log.Printf("close stored file %s: %v", fileID, err)
 	}
-	if r.Header.Get("Range") == "" {
+	if r.Header.Get("Range") == "" && r.URL.Query().Get("inline") != "1" && transfer.complete(r, file.Size) {
 		entry, err := s.store.EntryForFile(context.Background(), roomID, fileID)
-		if err == nil && entry.DeleteAfterDownload {
+		if err == nil && entry.DeleteAfterDownload && entry.ExpectedFiles == 1 {
 			deleted, deleteErr := s.store.DeleteEntry(context.Background(), roomID, entry.ID)
 			if deleteErr == nil {
 				s.removeDeletedObjects(deleted)
@@ -885,7 +910,12 @@ func (s *Server) downloadEntryArchive(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/zip")
 	w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": "files-" + entryID[:8] + ".zip"}))
 	w.Header().Set("Cache-Control", "private, no-store")
-	archive := zip.NewWriter(w)
+	if r.Method == http.MethodHead {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	transfer := newTransferWriter(w)
+	archive := zip.NewWriter(transfer)
 	names := uniqueArchiveNames(entryFiles)
 	for index, file := range entryFiles {
 		header := &zip.FileHeader{Name: names[index], Method: zip.Store}
@@ -906,8 +936,11 @@ func (s *Server) downloadEntryArchive(w http.ResponseWriter, r *http.Request) {
 		s.log.Printf("close entry archive: %v", err)
 		return
 	}
+	if !transfer.complete(r, -1) {
+		return
+	}
 	entry, err := s.store.GetEntry(context.Background(), roomID, entryID)
-	if err == nil && entry.DeleteAfterDownload {
+	if err == nil && entry.DeleteAfterDownload && entry.ExpectedFiles == 1 {
 		deleted, deleteErr := s.store.DeleteEntry(context.Background(), roomID, entryID)
 		if deleteErr == nil {
 			s.removeDeletedObjects(deleted)
@@ -962,7 +995,7 @@ func (s *Server) consumeFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	entry, err := s.store.EntryForFile(r.Context(), roomID, fileID)
-	if err != nil || !entry.DeleteAfterDownload {
+	if err != nil || !entry.DeleteAfterDownload || !entry.Published || entry.ExpectedFiles != 1 {
 		writeError(w, http.StatusConflict, "not_download_once", "File is not configured for deletion after download")
 		return
 	}
@@ -1130,15 +1163,13 @@ func (s *Server) authorizeUpload(w http.ResponseWriter, r *http.Request) (store.
 
 func (s *Server) clientIP(r *http.Request) string {
 	if s.cfg.TrustProxy {
-		if forwarded := r.Header.Get("Forwarded"); forwarded != "" {
-			for _, part := range strings.Split(forwarded, ";") {
-				if v, ok := strings.CutPrefix(strings.TrimSpace(part), "for="); ok {
-					return strings.Trim(v, `"[]`)
-				}
-			}
-		}
+		// The immediate trusted proxy must append its observed client address or
+		// overwrite XFF. Earlier entries and Forwarded are client-controlled.
 		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-			return strings.TrimSpace(strings.Split(xff, ",")[0])
+			parts := strings.Split(xff, ",")
+			if ip := net.ParseIP(strings.TrimSpace(parts[len(parts)-1])); ip != nil {
+				return ip.String()
+			}
 		}
 	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)

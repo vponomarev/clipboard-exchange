@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'self'; script-src 'self'">
+  <title>Хоткеи — Clipboard Exchange</title>
+  <link rel="stylesheet" href="settings.css">
+</head>
+<body>
+  <main>
+    <h1>Глобальные хоткеи</h1>
+    <p>Нажмите на поле, затем введите желаемую комбинацию. Буквенные клавиши требуют хотя бы один модификатор.</p>
+    <form id="hotkeys-form">
+      <label>Отправить системный буфер <input data-hotkey="sendClipboard" readonly></label>
+      <label>Отправить выделенный текст <input data-hotkey="sendSelection" readonly></label>
+      <label>Показать последнее сообщение <input data-hotkey="showLatest" readonly></label>
+      <label>Открыть последние сообщения <input data-hotkey="showHistory" readonly></label>
+      <p id="error" role="alert"></p>
+      <div class="actions">
+        <button type="button" class="secondary" id="cancel">Отмена</button>
+        <button type="submit">Сохранить</button>
+      </div>
+    </form>
+  </main>
+  <script src="settings.js"></script>
+</body>
+</html>

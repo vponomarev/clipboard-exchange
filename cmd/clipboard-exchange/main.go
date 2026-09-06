@@ -154,15 +154,22 @@ func runUploadCleanup(ctx context.Context, db *store.Store, files *filestore.Sto
 			log.Printf("WARNING: file storage disk space is low available_bytes=%d total_bytes=%d", available, total)
 		}
 	}
-	cleanup()
-	ticker := time.NewTicker(time.Hour)
+	nextCleanup := time.Time{}
+	tryCleanup := func() {
+		if !time.Now().Before(nextCleanup) && files.TryMaintenance(cleanup) {
+			nextCleanup = time.Now().Add(time.Hour)
+		}
+	}
+	tryCleanup()
+	// Retry a busy pass without blocking new requests behind long transfers.
+	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			cleanup()
+			tryCleanup()
 		}
 	}
 }

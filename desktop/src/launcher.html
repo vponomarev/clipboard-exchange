@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'self'; style-src 'self'; script-src 'self'">
+  <title>Подключение — Clipboard Exchange</title>
+  <link rel="stylesheet" href="launcher.css">
+</head>
+<body>
+  <main>
+    <img src="../assets/icon.svg" width="84" height="84" alt="">
+    <h1>Clipboard Exchange</h1>
+    <p>Подключите desktop-приложение к своему серверу.</p>
+    <form id="connect-form">
+      <label for="server-url">Адрес сервера или ссылка комнаты</label>
+      <input id="server-url" name="server-url" type="text" inputmode="url" autocapitalize="none" spellcheck="false" placeholder="https://clipboard.example.com" required autofocus>
+      <button type="submit">Подключиться</button>
+    </form>
+    <p id="error" role="alert"></p>
+    <small>Поддерживаются HTTPS и HTTP для доверенной локальной сети. Проверка TLS не отключается.</small>
+  </main>
+  <script src="launcher.js"></script>
+</body>
+</html>

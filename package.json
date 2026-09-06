@@ -2,6 +2,7 @@
   "name": "clipboard-exchange-e2e",
   "private": true,
   "scripts": {
+    "test:unit": "node --test tests/unit/*.test.cjs",
     "pretest:e2e": "go build -buildvcs=false -o clipboard-exchange-e2e.exe ./cmd/clipboard-exchange",
     "test:e2e": "playwright test"
   },
