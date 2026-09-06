@@ -88,7 +88,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install NSIS
-        run: choco install nsis --yes --no-progress
+        shell: pwsh
+        run: |
+          choco install nsis --yes --no-progress
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $nsis = @("${env:ProgramFiles(x86)}\NSIS", "$env:ProgramFiles\NSIS") | Where-Object { Test-Path (Join-Path $_ "makensis.exe") } | Select-Object -First 1
+          if (!$nsis) { throw "NSIS installation was not found" }
+          $nsis | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
       - name: Build, unit test, and package native Win32 client
         shell: pwsh
         run: |
